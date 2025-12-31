@@ -60,7 +60,7 @@ function getTextFromMessage(msg: SDKMessage): string | null {
 }
 
 /**
- * Manages Claude Code sessions using the Agent SDK V2.
+ * Manages Claude Code sessions using the Agent SDK V1.
  */
 class ClaudeSession {
   sessionId: string | null = null;
