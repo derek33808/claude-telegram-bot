@@ -131,6 +131,10 @@ Claude Code can run in this folder via a Telegram bot (code located at `~/dev/cl
 
 One of the most magical uses of this setup is having Claude act as a personal trainer that knows your body, your training plan, and your recent activity.
 
+I recorded demos on my Mac, but this is what normally do on the go, from my iPhone:
+
+![Workout example](../assets/demo-workout.gif)
+
 ### The Setup
 
 1. **[Health Auto Export](https://www.healthyapps.dev/)** - An iOS app that syncs Apple Health data to iCloud as daily JSON files
