@@ -131,7 +131,11 @@ export async function handleCallback(ctx: Context): Promise<void> {
     }
 
     if (String(error).includes("abort") || String(error).includes("cancel")) {
-      await ctx.reply("🛑 Query stopped.");
+      // Only show "Query stopped" if it was an explicit stop, not an interrupt from a new message
+      const wasInterrupt = session.consumeInterruptFlag();
+      if (!wasInterrupt) {
+        await ctx.reply("🛑 Query stopped.");
+      }
     } else {
       await ctx.reply(`❌ Error: ${String(error).slice(0, 200)}`);
     }

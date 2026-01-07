@@ -5,24 +5,28 @@
  * V1 supports full options (cwd, mcpServers, settingSources, etc.)
  */
 
-import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  query,
+  type Options,
+  type SDKMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import { readFileSync } from "fs";
-import type { StatusCallback, SessionData, TokenUsage } from "./types";
 import type { Context } from "grammy";
 import {
-  WORKING_DIR,
-  SAFETY_PROMPT,
-  MCP_SERVERS,
   ALLOWED_PATHS,
+  MCP_SERVERS,
+  SAFETY_PROMPT,
   SESSION_FILE,
-  THINKING_KEYWORDS,
-  THINKING_DEEP_KEYWORDS,
-  TEMP_PATHS,
   STREAMING_THROTTLE_MS,
+  TEMP_PATHS,
+  THINKING_DEEP_KEYWORDS,
+  THINKING_KEYWORDS,
+  WORKING_DIR,
 } from "./config";
-import { isPathAllowed, checkCommandSafety } from "./security";
 import { formatToolStatus } from "./formatting";
 import { checkPendingAskUserRequests } from "./handlers/streaming";
+import { checkCommandSafety, isPathAllowed } from "./security";
+import type { SessionData, StatusCallback, TokenUsage } from "./types";
 
 /**
  * Determine thinking token budget based on message keywords.
@@ -76,6 +80,7 @@ class ClaudeSession {
   private isQueryRunning = false;
   private stopRequested = false;
   private _isProcessing = false;
+  private _wasInterruptedByNewMessage = false;
 
   get isActive(): boolean {
     return this.sessionId !== null;
@@ -83,6 +88,34 @@ class ClaudeSession {
 
   get isRunning(): boolean {
     return this.isQueryRunning || this._isProcessing;
+  }
+
+  /**
+   * Check if the last stop was triggered by a new message interrupt (! prefix).
+   * Resets the flag when called. Also clears stopRequested so new messages can proceed.
+   */
+  consumeInterruptFlag(): boolean {
+    const was = this._wasInterruptedByNewMessage;
+    this._wasInterruptedByNewMessage = false;
+    if (was) {
+      // Clear stopRequested so the new message can proceed
+      this.stopRequested = false;
+    }
+    return was;
+  }
+
+  /**
+   * Mark that this stop is from a new message interrupt.
+   */
+  markInterrupt(): void {
+    this._wasInterruptedByNewMessage = true;
+  }
+
+  /**
+   * Clear the stopRequested flag (used after interrupt to allow new message to proceed).
+   */
+  clearStopRequested(): void {
+    this.stopRequested = false;
   }
 
   /**
@@ -140,27 +173,31 @@ class ClaudeSession {
     const isNewSession = !this.isActive;
     const thinkingTokens = getThinkingLevel(message);
     const thinkingLabel =
-      { 0: "off", 10000: "normal", 50000: "deep" }[thinkingTokens] || String(thinkingTokens);
+      { 0: "off", 10000: "normal", 50000: "deep" }[thinkingTokens] ||
+      String(thinkingTokens);
 
     // Inject current date/time at session start so Claude doesn't need to call a tool for it
     let messageToSend = message;
     if (isNewSession) {
       const now = new Date();
-      const datePrefix = `[Current date/time: ${now.toLocaleDateString("en-US", {
-        weekday: "long",
-        year: "numeric",
-        month: "long",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-        timeZoneName: "short",
-      })}]\n\n`;
+      const datePrefix = `[Current date/time: ${now.toLocaleDateString(
+        "en-US",
+        {
+          weekday: "long",
+          year: "numeric",
+          month: "long",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+          timeZoneName: "short",
+        }
+      )}]\n\n`;
       messageToSend = datePrefix + message;
     }
 
     // Build SDK V1 options - supports all features
-    const options: Record<string, unknown> = {
-      model: "claude-sonnet-4-20250514",
+    const options: Options = {
+      model: "claude-sonnet-4-5",
       cwd: WORKING_DIR,
       settingSources: ["project" as const],
       permissionMode: "bypassPermissions" as const,
@@ -178,7 +215,12 @@ class ClaudeSession {
     }
 
     if (this.sessionId && !isNewSession) {
-      console.log(`RESUMING session ${this.sessionId.slice(0, 8)}... (thinking=${thinkingLabel})`);
+      console.log(
+        `RESUMING session ${this.sessionId.slice(
+          0,
+          8
+        )}... (thinking=${thinkingLabel})`
+      );
     } else {
       console.log(`STARTING new Claude session (thinking=${thinkingLabel})`);
       this.sessionId = null;
@@ -186,7 +228,9 @@ class ClaudeSession {
 
     // Check if stop was requested during processing phase
     if (this.stopRequested) {
-      console.log("Query cancelled before starting (stop was requested during processing)");
+      console.log(
+        "Query cancelled before starting (stop was requested during processing)"
+      );
       this.stopRequested = false;
       throw new Error("Query cancelled");
     }
@@ -270,7 +314,9 @@ class ClaudeSession {
                       filePath.includes("/.claude/"));
 
                   if (!isTmpRead && !isPathAllowed(filePath)) {
-                    console.warn(`BLOCKED: File access outside allowed paths: ${filePath}`);
+                    console.warn(
+                      `BLOCKED: File access outside allowed paths: ${filePath}`
+                    );
                     await statusCallback("tool", `Access denied: ${filePath}`);
                     throw new Error(`File access blocked: ${filePath}`);
                   }
@@ -279,7 +325,11 @@ class ClaudeSession {
 
               // Segment ends when tool starts
               if (currentSegmentText) {
-                await statusCallback("segment_end", currentSegmentText, currentSegmentId);
+                await statusCallback(
+                  "segment_end",
+                  currentSegmentText,
+                  currentSegmentId
+                );
                 currentSegmentId++;
                 currentSegmentText = "";
               }
@@ -302,7 +352,10 @@ class ClaudeSession {
 
                 // Retry a few times in case of timing issues
                 for (let attempt = 0; attempt < 3; attempt++) {
-                  const buttonsSent = await checkPendingAskUserRequests(ctx, chatId);
+                  const buttonsSent = await checkPendingAskUserRequests(
+                    ctx,
+                    chatId
+                  );
                   if (buttonsSent) {
                     askUserTriggered = true;
                     break;
@@ -321,8 +374,15 @@ class ClaudeSession {
 
               // Stream text updates (throttled)
               const now = Date.now();
-              if (now - lastTextUpdate > STREAMING_THROTTLE_MS && currentSegmentText.length > 20) {
-                await statusCallback("text", currentSegmentText, currentSegmentId);
+              if (
+                now - lastTextUpdate > STREAMING_THROTTLE_MS &&
+                currentSegmentText.length > 20
+              ) {
+                await statusCallback(
+                  "text",
+                  currentSegmentText,
+                  currentSegmentId
+                );
                 lastTextUpdate = now;
               }
             }
@@ -343,7 +403,11 @@ class ClaudeSession {
           if ("usage" in event && event.usage) {
             this.lastUsage = event.usage as TokenUsage;
             const u = this.lastUsage;
-            console.log(`Usage: in=${u.input_tokens} out=${u.output_tokens} cache_read=${u.cache_read_input_tokens || 0} cache_create=${u.cache_creation_input_tokens || 0}`);
+            console.log(
+              `Usage: in=${u.input_tokens} out=${u.output_tokens} cache_read=${
+                u.cache_read_input_tokens || 0
+              } cache_create=${u.cache_creation_input_tokens || 0}`
+            );
           }
         }
       }
@@ -351,9 +415,13 @@ class ClaudeSession {
       // V1 query completes automatically when the generator ends
     } catch (error) {
       const errorStr = String(error).toLowerCase();
-      const isCleanupError = errorStr.includes("cancel") || errorStr.includes("abort");
+      const isCleanupError =
+        errorStr.includes("cancel") || errorStr.includes("abort");
 
-      if (isCleanupError && (queryCompleted || askUserTriggered || this.stopRequested)) {
+      if (
+        isCleanupError &&
+        (queryCompleted || askUserTriggered || this.stopRequested)
+      ) {
         console.warn(`Suppressed post-completion error: ${error}`);
       } else {
         console.error(`Error in query: ${error}`);
@@ -434,13 +502,25 @@ class ClaudeSession {
       }
 
       if (data.working_dir && data.working_dir !== WORKING_DIR) {
-        return [false, `Session was for different directory: ${data.working_dir}`];
+        return [
+          false,
+          `Session was for different directory: ${data.working_dir}`,
+        ];
       }
 
       this.sessionId = data.session_id;
       this.lastActivity = new Date();
-      console.log(`Resumed session ${data.session_id.slice(0, 8)}... (saved at ${data.saved_at})`);
-      return [true, `Resumed session \`${data.session_id.slice(0, 8)}...\` (saved at ${data.saved_at})`];
+      console.log(
+        `Resumed session ${data.session_id.slice(0, 8)}... (saved at ${
+          data.saved_at
+        })`
+      );
+      return [
+        true,
+        `Resumed session \`${data.session_id.slice(0, 8)}...\` (saved at ${
+          data.saved_at
+        })`,
+      ];
     } catch (error) {
       console.error(`Failed to resume session: ${error}`);
       return [false, `Failed to load session: ${error}`];

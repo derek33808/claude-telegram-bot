@@ -58,6 +58,7 @@ export async function handleNew(ctx: Context): Promise<void> {
     const result = await session.stop();
     if (result) {
       await Bun.sleep(100);
+      session.clearStopRequested();
     }
   }
 
@@ -68,7 +69,7 @@ export async function handleNew(ctx: Context): Promise<void> {
 }
 
 /**
- * /stop - Stop the current query.
+ * /stop - Stop the current query (silently).
  */
 export async function handleStop(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
@@ -80,16 +81,14 @@ export async function handleStop(ctx: Context): Promise<void> {
 
   if (session.isRunning) {
     const result = await session.stop();
-    if (result === "stopped") {
-      await ctx.reply("🛑 Stopping current query...");
-    } else if (result === "pending") {
-      await ctx.reply("🛑 Will cancel before query starts...");
-    } else {
-      await ctx.reply("No query to stop.");
+    if (result) {
+      // Wait for the abort to be processed, then clear stopRequested so next message can proceed
+      await Bun.sleep(100);
+      session.clearStopRequested();
     }
-  } else {
-    await ctx.reply("No query currently running.");
+    // Silent stop - no message shown
   }
+  // If nothing running, also stay silent
 }
 
 /**
