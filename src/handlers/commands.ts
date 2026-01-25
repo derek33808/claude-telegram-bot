@@ -35,6 +35,7 @@ export async function handleStart(ctx: Context): Promise<void> {
       `/status - 查看详细状态\n` +
       `/resume - 恢复 Bot 会话\n` +
       `/sessions - 接管终端会话\n` +
+      `/history - 查看对话历史\n` +
       `/retry - 重试上条消息\n` +
       `/health - 系统健康检查\n` +
       `/restart - 重启机器人\n\n` +
@@ -66,6 +67,7 @@ export async function handleHelp(ctx: Context): Promise<void> {
       `/status - 查看详细的会话状态信息\n` +
       `/resume - 恢复之前保存的 Bot 会话\n` +
       `/sessions - 列出并接管终端 Claude Code 会话\n` +
+      `/history - 查看当前会话的对话历史\n` +
       `/retry - 重新发送上一条消息\n\n` +
       `<b>系统管理:</b>\n` +
       `/health - 检查 Bot 健康状态（内存、运行时间等）\n` +
@@ -533,4 +535,28 @@ export async function handleRetry(ctx: Context): Promise<void> {
   } as Context;
 
   await handleText(fakeCtx);
+}
+
+/**
+ * /history - Show conversation history for current session.
+ */
+export async function handleHistory(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  if (!session.isActive) {
+    await ctx.reply("❌ No active session. Start a conversation first.");
+    return;
+  }
+
+  const history = session.getMessageHistory(20); // Get last 20 messages
+
+  await ctx.reply(
+    `📜 <b>Conversation History</b>\n\n${history}`,
+    { parse_mode: "HTML" }
+  );
 }

@@ -19,6 +19,7 @@ import {
   handleRetry,
   handleSessions,
   handleHealth,
+  handleHistory,
   handleText,
   handleVoice,
   handlePhoto,
@@ -62,6 +63,7 @@ bot.command("restart", handleRestart);
 bot.command("retry", handleRetry);
 bot.command("sessions", handleSessions);
 bot.command("health", handleHealth);
+bot.command("history", handleHistory);
 
 // ============== Message Handlers ==============
 

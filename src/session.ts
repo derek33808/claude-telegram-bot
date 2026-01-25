@@ -3,6 +3,11 @@
  *
  * ClaudeSession class manages Claude Code sessions using the Agent SDK V1.
  * V1 supports full options (cwd, mcpServers, settingSources, etc.)
+ *
+ * Multi-device support:
+ * - Uses SQLite for session state synchronization
+ * - Implements locking to prevent concurrent access
+ * - Stores message history for all devices
  */
 
 import {
@@ -22,6 +27,7 @@ import {
   THINKING_DEEP_KEYWORDS,
   THINKING_KEYWORDS,
   WORKING_DIR,
+  DB_PATH,
 } from "./config";
 import { formatToolStatus } from "./formatting";
 import { checkPendingAskUserRequests } from "./handlers/streaming";
@@ -33,6 +39,7 @@ import type {
   TokenUsage,
   ClaudeCodeSession,
 } from "./types";
+import { SessionStore } from "./db/store";
 
 /**
  * Determine thinking token budget based on message keywords.
@@ -75,6 +82,9 @@ function getTextFromMessage(msg: SDKMessage): string | null {
 // Maximum number of sessions to keep in history
 const MAX_SESSIONS = 5;
 
+// Global session store instance
+const store = new SessionStore(DB_PATH);
+
 class ClaudeSession {
   sessionId: string | null = null;
   lastActivity: Date | null = null;
@@ -86,6 +96,10 @@ class ClaudeSession {
   lastUsage: TokenUsage | null = null;
   lastMessage: string | null = null;
   conversationTitle: string | null = null;
+
+  // Current user context
+  private currentUserId: number | null = null;
+  private currentUsername: string | null = null;
 
   private abortController: AbortController | null = null;
   private isQueryRunning = false;
@@ -176,9 +190,64 @@ class ClaudeSession {
     chatId?: number,
     ctx?: Context
   ): Promise<string> {
+    // Update current user context
+    this.currentUserId = userId;
+    this.currentUsername = username;
+
+    // Register/update user in database
+    store.upsertUser(userId, username);
+
+    // Try to acquire lock (prevent concurrent access from multiple devices)
+    const lockAcquired = store.acquireLock(userId);
+    if (!lockAcquired) {
+      const lock = store.getLock(userId);
+      const waitTime = lock ? Math.ceil((new Date(lock.expires_at).getTime() - Date.now()) / 1000) : 30;
+      throw new Error(
+        `⏳ Another device is currently using Claude. Please wait ${waitTime}s or use /stop to interrupt.`
+      );
+    }
+
+    try {
+      return await this._sendMessageStreamingInternal(
+        message,
+        username,
+        userId,
+        statusCallback,
+        chatId,
+        ctx
+      );
+    } finally {
+      // Always release lock when done
+      store.releaseLock(userId);
+      store.updateState(userId, { is_processing: false, current_tool: null });
+    }
+  }
+
+  /**
+   * Internal implementation of sendMessageStreaming (after lock acquired)
+   */
+  private async _sendMessageStreamingInternal(
+    message: string,
+    username: string,
+    userId: number,
+    statusCallback: StatusCallback,
+    chatId?: number,
+    ctx?: Context
+  ): Promise<string> {
     // Set chat context for ask_user MCP tool
     if (chatId) {
       process.env.TELEGRAM_CHAT_ID = String(chatId);
+    }
+
+    // Update processing state
+    store.updateState(userId, { is_processing: true });
+
+    // Load active session from database (for multi-device sync)
+    const activeSession = store.getActiveSession(userId);
+    if (activeSession && !this.sessionId) {
+      this.sessionId = activeSession.session_id;
+      this.conversationTitle = activeSession.title;
+      console.log(`Loaded active session from DB: ${this.sessionId.slice(0, 8)}...`);
     }
 
     const isNewSession = !this.isActive;
@@ -283,7 +352,14 @@ class ClaudeSession {
         if (!this.sessionId && event.session_id) {
           this.sessionId = event.session_id;
           console.log(`GOT session_id: ${this.sessionId!.slice(0, 8)}...`);
+
+          // Save to both legacy file and database
           this.saveSession();
+
+          // Create session in database
+          if (this.currentUserId) {
+            store.createSession(this.sessionId, this.currentUserId, WORKING_DIR, this.conversationTitle ?? undefined);
+          }
         }
 
         // Handle different message types
@@ -451,6 +527,36 @@ class ClaudeSession {
     this.lastError = null;
     this.lastErrorTime = null;
 
+    // Save message history to database
+    if (this.sessionId && this.currentUserId) {
+      const now = new Date().toISOString();
+
+      // Save user message
+      store.saveMessage({
+        session_id: this.sessionId,
+        role: "user",
+        content: message,
+        created_at: now,
+      });
+
+      // Save assistant response (if not ask_user)
+      if (!askUserTriggered) {
+        const assistantResponse = responseParts.join("");
+        if (assistantResponse) {
+          store.saveMessage({
+            session_id: this.sessionId,
+            role: "assistant",
+            content: assistantResponse,
+            created_at: now,
+            metadata: this.lastUsage ? JSON.stringify(this.lastUsage) : undefined,
+          });
+        }
+      }
+
+      // Update session timestamp
+      store.createSession(this.sessionId, this.currentUserId, WORKING_DIR, this.conversationTitle ?? undefined);
+    }
+
     // If ask_user was triggered, return early - user will respond via button
     if (askUserTriggered) {
       await statusCallback("done", "");
@@ -471,6 +577,11 @@ class ClaudeSession {
    * Kill the current session (clear session_id).
    */
   async kill(): Promise<void> {
+    // Deactivate in database (for multi-device sync)
+    if (this.currentUserId) {
+      store.deactivateUserSessions(this.currentUserId);
+    }
+
     this.sessionId = null;
     this.lastActivity = null;
     this.conversationTitle = null;
@@ -537,13 +648,54 @@ class ClaudeSession {
 
   /**
    * Get list of saved sessions for display.
+   * Now uses database for multi-device sync.
    */
   getSessionList(): SavedSession[] {
+    // If we have a current user, get from database
+    if (this.currentUserId) {
+      const dbSessions = store.getUserSessions(this.currentUserId, MAX_SESSIONS);
+      return dbSessions.map(s => ({
+        session_id: s.session_id,
+        saved_at: s.updated_at,
+        working_dir: s.working_dir,
+        title: s.title || "Untitled session",
+      }));
+    }
+
+    // Fallback to legacy file-based sessions
     const history = this.loadSessionHistory();
-    // Filter to only sessions for current working directory
     return history.sessions.filter(
       (s) => !s.working_dir || s.working_dir === WORKING_DIR
     );
+  }
+
+  /**
+   * Get message history for current session
+   */
+  getMessageHistory(limit?: number): string {
+    if (!this.sessionId) {
+      return "No active session";
+    }
+
+    const messages = store.getMessages(this.sessionId, limit);
+    if (messages.length === 0) {
+      return "No message history found";
+    }
+
+    return messages
+      .map(m => {
+        const timestamp = new Date(m.created_at).toLocaleString();
+        const role = m.role === "user" ? "👤 User" : "🤖 Claude";
+        return `[${timestamp}] ${role}:\n${m.content.slice(0, 200)}${m.content.length > 200 ? '...' : ''}`;
+      })
+      .join("\n\n---\n\n");
+  }
+
+  /**
+   * Get database statistics (for /health command)
+   */
+  getDbStats() {
+    return store.getStats();
   }
 
   /**

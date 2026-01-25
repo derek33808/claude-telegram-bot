@@ -213,6 +213,9 @@ export const SESSION_FILE = "/tmp/claude-telegram-session.json";
 export const RESTART_FILE = "/tmp/claude-telegram-restart.json";
 export const TEMP_DIR = "/tmp/telegram-bot";
 
+// Database for multi-device session synchronization
+export const DB_PATH = process.env.DB_PATH || `${HOME}/.claude/telegram-bot/sessions.db`;
+
 // Temp paths that are always allowed for bot operations
 export const TEMP_PATHS = ["/tmp/", "/private/tmp/", "/var/folders/"];
 

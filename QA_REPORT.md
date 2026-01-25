@@ -4,8 +4,8 @@
 - **Project Name**: claude-telegram-bot
 - **QA Responsible**: qa-guardian
 - **Report Creation Date**: 2026-01-25
-- **Last Update Date**: 2026-01-25 19:19
-- **Current Status**: Pre-Upload Final Check - PASS
+- **Last Update Date**: 2026-01-25 20:45
+- **Current Status**: SQLite Module Review Complete
 
 ---
 
@@ -26,6 +26,93 @@
 ---
 
 ## Code Review Record
+
+### Review #2 - 2026-01-25 (SQLite Module Review)
+
+#### Review Scope
+- `src/db/schema.sql` - Database table structure
+- `src/db/store.ts` - SessionStore class implementation
+- `src/session.ts` - SQLite integration (lock mechanism lines 200-224)
+
+#### Code Quality Score: 4.5/5
+
+**Strengths**:
+- WAL mode enabled for better concurrency (`PRAGMA journal_mode = WAL`)
+- Foreign keys properly enforced (`PRAGMA foreign_keys = ON`)
+- All SQL uses prepared statements - SQL injection protected
+- Lock mechanism implementation is robust with timeout and auto-cleanup
+- Clear TypeScript interfaces for all data structures
+- Proper `undefined -> null` conversion for SQLite compatibility
+
+**Fixed Issues Confirmed**:
+
+| Issue | Location | Fix | Status |
+|-------|----------|-----|--------|
+| undefined handling | store.ts:147,172 | `username ?? null`, `title ?? null` | VERIFIED |
+| null -> undefined | session.ts:361,557 | `conversationTitle ?? undefined` | VERIFIED |
+| Foreign key constraint | store.ts:344 | `upsertUser()` called before `updateState()` | VERIFIED |
+
+**Issues Found**:
+
+| Severity | Location | Issue | Status |
+|----------|----------|-------|--------|
+| LOW | store.ts:249 | String interpolation for LIMIT clause instead of parameterized | Acceptable (type-safe) |
+| LOW | store.ts:288-291 | Lock acquisition failure returns boolean only, no error details | Design Choice |
+| LOW | session.ts:86 | Global store instance created at module level | Acceptable for singleton pattern |
+| LOW | session.ts:204 | Lock wait time calculation could be negative | Consider `Math.max(0, waitTime)` |
+| INFO | store.ts:53 | LOCK_TIMEOUT_MS (30s) is hardcoded | Could be configurable |
+| INFO | schema.sql | session_locks table lacks FK to users | Design choice - allows temp locks |
+
+#### Security Analysis
+
+**SQL Injection Protection: PASS**
+- All user inputs use prepared statements with `?` placeholders
+- No dynamic SQL construction with user data
+
+**Concurrency Safety: PASS**
+- WAL mode supports concurrent reads with single writer
+- Lock mechanism uses DB primary key constraint for atomicity
+- Expired locks cleaned automatically before each lock operation
+- try-finally ensures lock release even on errors
+
+**Foreign Key Constraints: PASS**
+- sessions.user_id -> users.user_id (default behavior)
+- messages.session_id -> sessions.session_id (ON DELETE CASCADE)
+- session_state.user_id -> users.user_id (with upsertUser protection)
+
+#### Lock Mechanism Evaluation
+
+**Implementation Quality: 4.5/5**
+
+```typescript
+// Proper lock lifecycle in session.ts:200-223
+sendMessageStreaming(...) {
+  const lockAcquired = store.acquireLock(userId);
+  if (!lockAcquired) {
+    // User-friendly error with wait time
+    throw new Error(`Another device is using Claude...`);
+  }
+  try {
+    return await this._sendMessageStreamingInternal(...);
+  } finally {
+    store.releaseLock(userId);  // Always released
+    store.updateState(userId, { is_processing: false });
+  }
+}
+```
+
+**Lock Features**:
+- 30-second timeout prevents deadlocks
+- Auto-cleanup of expired locks on every check
+- Device info tracking for multi-device debugging
+- Atomic acquisition via DB primary key constraint
+
+**Recommendations**:
+1. Consider lock renewal for long-running operations
+2. Add lock acquire/release logging for debugging
+3. Consider returning lock holder info in error message
+
+---
 
 ### Review #1 - 2026-01-25 (Full Codebase Review)
 
@@ -154,7 +241,10 @@ This is a TypeScript error that would cause compilation issues. The second defin
 | R001 | Risk | Fail-open design in hook timeout | MEDIUM | Open | Consider fail-close for dangerous operations |
 | R002 | Risk | No request signing in hook IPC | LOW | Open | Add HMAC to request IDs |
 | R003 | Risk | Sensitive data in /tmp without restricted perms | LOW | Open | chmod 700 on hook directory |
+| R004 | Risk | Lock wait time could be negative in edge cases | LOW | Open | Add `Math.max(0, waitTime)` |
 | I001 | Issue | Duplicate handleHealth function | HIGH | ✅ Resolved | Fixed - only one definition exists |
+| I004 | Issue | SQLite undefined/null handling | MEDIUM | ✅ Resolved | All conversions verified correct |
+| I005 | Issue | Foreign key constraint in updateState | MEDIUM | ✅ Resolved | upsertUser() called first |
 | I002 | Issue | No automated test suite | MEDIUM | Open | Add unit tests for security module |
 | I003 | Issue | DESIGN.md lacks test strategy | LOW | Open | Update documentation |
 

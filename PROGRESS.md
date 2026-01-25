@@ -1,11 +1,114 @@
 # 项目进度
 
 ## 当前状态
-- **阶段**: 测试验证
-- **任务**: Bot 功能测试通过
-- **状态**: ✅ 完成
+- **阶段**: SQLite 功能测试完成
+- **任务**: 等待 QA 审查
+- **状态**: ✅ 测试通过
 
 ## 执行日志（按时间倒序）
+
+### 2026-01-25 22:50 - SQLite 外键错误修复及测试验证
+**任务**: 修复外键约束错误，验证 Bot 功能
+**状态**: ✅ 完成
+**完成内容**:
+- [x] 修复 TypeScript 类型错误 (4处)
+- [x] 修复 SQLite 外键约束错误
+- [x] 启动 Bot 测试
+- [x] Telegram Web 发送测试消息验证
+
+**修复的问题**:
+| 文件 | 行号 | 问题 | 解决方案 |
+|------|------|------|----------|
+| `store.ts` | 147 | `undefined` 不可赋值给 SQLite | `username ?? null` |
+| `store.ts` | 172 | `undefined` 不可赋值给 SQLite | `title ?? null` |
+| `session.ts` | 361 | `null` 不可赋值给 `string \| undefined` | `?? undefined` |
+| `session.ts` | 557 | `null` 不可赋值给 `string \| undefined` | `?? undefined` |
+| `store.ts` | 344 | 外键约束失败 | `updateState()` 前调用 `upsertUser()` |
+
+**测试结果**:
+- ✅ SQLite 数据库初始化成功
+- ✅ Bot 启动正常 (`@dy_claude_bot`)
+- ✅ 消息处理正常（测试发送 "hello, test sqlite"）
+- ✅ 会话保存正常 (`Session saved to /tmp/...`)
+- ⚠️ 并发锁需手动验证（Bot 响应太快）
+
+**下一步**:
+- [ ] QA 审查 SQLite 模块
+- [ ] 提交代码到 GitHub
+
+---
+
+### 2026-01-25 21:00 - SQLite 多设备并发控制（功能实现）
+**任务**: 实现 SQLite 数据库存储，解决多 Telegram 客户端并发访问问题
+**状态**: ✅ 完成
+**完成内容**:
+- [x] 创建数据库 schema (`src/db/schema.sql`)
+- [x] 实现 SessionStore 类 (`src/db/store.ts`)
+- [x] 集成到 session.ts 主流程
+- [x] 配置 WAL 模式提升并发性能
+
+**关键文件**:
+- `src/db/schema.sql` - 数据库表结构定义
+- `src/db/store.ts` - SessionStore 类实现 (408行)
+- `src/session.ts` - 集成锁机制 (第201-221行)
+- `src/config.ts` - DB_PATH 配置
+
+**数据库表结构**:
+| 表名 | 用途 |
+|------|------|
+| `users` | Telegram 用户信息 |
+| `sessions` | Claude 会话记录 |
+| `messages` | 消息历史 |
+| `session_locks` | 并发锁控制 |
+| `session_state` | 会话状态 |
+
+**并发控制机制**:
+- `acquireLock(userId)` - 获取用户锁（30秒超时）
+- `releaseLock(userId)` - 释放锁
+- 锁获取失败时返回等待时间提示
+- 过期锁自动清理
+
+**技术特性**:
+- 使用 Bun 内置 SQLite (`bun:sqlite`)
+- WAL (Write-Ahead Logging) 模式
+- 外键约束开启
+- 索引优化查询性能
+
+---
+
+### 2026-01-25 19:20 - QA 检查并上传代码
+**任务**: 进行 QA 检查并将代码推送到 GitHub
+**状态**: ✅ 完成
+**完成内容**:
+- [x] 添加 `/help` 命令显示所有可用命令
+- [x] 创建详细的 QA_REPORT.md
+- [x] TypeScript 编译检查通过
+- [x] 更新 QA 报告状态为"已批准上传"
+- [x] Git commit 并推送到 GitHub
+
+**关键文件**:
+- `QA_REPORT.md` - 完整的质量评估报告
+- `src/handlers/commands.ts` - 添加 handleHelp 函数
+- `src/handlers/index.ts` - 导出 handleHelp
+- `src/index.ts` - 注册 /help 命令
+
+**QA 结果**:
+- 整体评分: 3.5/5
+- TypeScript 编译: ✅ 通过
+- 关键问题: 全部解决
+- 发布状态: ✅ 已批准
+
+**GitHub 提交**:
+- Commit: `9a542e9` - feat: add /help command and QA report
+- 推送状态: ✅ 成功
+- 仓库: https://github.com/derek33808/claude-telegram-bot
+
+**下一步**:
+- [ ] 添加自动化测试（建议）
+- [ ] 部署为 macOS LaunchAgent 服务
+- [ ] 测试 Hook 机制的完整流程
+
+---
 
 ### 2026-01-25 16:30 - Bot 功能测试验证
 **任务**: 启动 Bot 并通过 Telegram Web 进行功能测试
