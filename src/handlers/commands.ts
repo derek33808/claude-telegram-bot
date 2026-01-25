@@ -29,17 +29,55 @@ export async function handleStart(ctx: Context): Promise<void> {
       `状态: ${status}\n` +
       `工作目录: <code>${workDir}</code>\n\n` +
       `<b>命令:</b>\n` +
+      `/help - 显示所有命令\n` +
       `/new - 开始新对话\n` +
       `/stop - 中断当前查询\n` +
       `/status - 查看详细状态\n` +
       `/resume - 恢复 Bot 会话\n` +
       `/sessions - 接管终端会话\n` +
       `/retry - 重试上条消息\n` +
+      `/health - 系统健康检查\n` +
       `/restart - 重启机器人\n\n` +
       `<b>提示:</b>\n` +
       `• 用 <code>!</code> 前缀可中断当前查询\n` +
       `• 使用"思考"关键词触发深度推理\n` +
       `• 支持发送图片、语音、文档`,
+    { parse_mode: "HTML" }
+  );
+}
+
+/**
+ * /help - Show all available commands with descriptions.
+ */
+export async function handleHelp(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  await ctx.reply(
+    `📚 <b>Claude Telegram Bot - 命令帮助</b>\n\n` +
+      `<b>会话管理:</b>\n` +
+      `/start - 显示欢迎消息和当前状态\n` +
+      `/new - 开始新的对话会话\n` +
+      `/stop - 中断当前正在执行的查询\n` +
+      `/status - 查看详细的会话状态信息\n` +
+      `/resume - 恢复之前保存的 Bot 会话\n` +
+      `/sessions - 列出并接管终端 Claude Code 会话\n` +
+      `/retry - 重新发送上一条消息\n\n` +
+      `<b>系统管理:</b>\n` +
+      `/health - 检查 Bot 健康状态（内存、运行时间等）\n` +
+      `/restart - 重启 Bot 进程\n` +
+      `/help - 显示此帮助信息\n\n` +
+      `<b>特殊功能:</b>\n` +
+      `• 发送 <code>!</code> 开头的消息可立即中断当前查询\n` +
+      `• 消息中包含"思考"关键词会触发深度推理模式\n` +
+      `• 支持发送图片、语音消息、文档文件\n` +
+      `• Hook 机制会拦截敏感操作（文件写入、Git 等）并推送审批\n\n` +
+      `<b>会话接管:</b>\n` +
+      `使用 /sessions 可以接管在终端运行的 Claude Code 会话，实现远程控制。`,
     { parse_mode: "HTML" }
   );
 }
@@ -495,29 +533,4 @@ export async function handleRetry(ctx: Context): Promise<void> {
   } as Context;
 
   await handleText(fakeCtx);
-}
-
-/**
- * /health - Check bot health status.
- */
-export async function handleHealth(ctx: Context): Promise<void> {
-  const userId = ctx.from?.id;
-
-  if (!isAuthorized(userId, ALLOWED_USERS)) {
-    await ctx.reply("Unauthorized.");
-    return;
-  }
-
-  const uptime = process.uptime();
-  const memory = process.memoryUsage();
-
-  const status = [
-    `✅ <b>Bot Health Check</b>\n`,
-    `运行时间: ${formatUptime(uptime)}`,
-    `会话状态: ${session.isActive ? "🟢 Active" : "⚪️ Idle"}`,
-    `内存使用: ${(memory.heapUsed / 1024 / 1024).toFixed(1)} MB`,
-    `工作目录: <code>${WORKING_DIR}</code>`,
-  ].join("\n");
-
-  await ctx.reply(status, { parse_mode: "HTML" });
 }
