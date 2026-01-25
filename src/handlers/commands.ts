@@ -106,11 +106,17 @@ export async function handleStatus(ctx: Context): Promise<void> {
 
   const lines: string[] = ["📊 <b>Bot Status</b>\n"];
 
+  // Bot uptime
+  const uptime = process.uptime();
+  const uptimeStr = formatUptime(uptime);
+  lines.push(`⏱️ Uptime: ${uptimeStr}`);
+
   // Session status
   if (session.isActive) {
-    lines.push(`✅ Session: Active (${session.sessionId?.slice(0, 8)}...)`);
+    lines.push(`\n✅ <b>Session</b>: Active`);
+    lines.push(`   ID: <code>${session.sessionId?.slice(0, 16)}...</code>`);
   } else {
-    lines.push("⚪ Session: None");
+    lines.push("\n⚪ <b>Session</b>: None");
   }
 
   // Query status
@@ -118,12 +124,12 @@ export async function handleStatus(ctx: Context): Promise<void> {
     const elapsed = session.queryStarted
       ? Math.floor((Date.now() - session.queryStarted.getTime()) / 1000)
       : 0;
-    lines.push(`🔄 Query: Running (${elapsed}s)`);
+    lines.push(`\n🔄 <b>Query</b>: Running (${elapsed}s)`);
     if (session.currentTool) {
-      lines.push(`   └─ ${session.currentTool}`);
+      lines.push(`   └─ Tool: ${session.currentTool}`);
     }
   } else {
-    lines.push("⚪ Query: Idle");
+    lines.push("\n⚪ <b>Query</b>: Idle");
     if (session.lastTool) {
       lines.push(`   └─ Last: ${session.lastTool}`);
     }
@@ -134,14 +140,14 @@ export async function handleStatus(ctx: Context): Promise<void> {
     const ago = Math.floor(
       (Date.now() - session.lastActivity.getTime()) / 1000
     );
-    lines.push(`\n⏱️ Last activity: ${ago}s ago`);
+    lines.push(`\n⏰ Last activity: ${formatDuration(ago)} ago`);
   }
 
   // Usage stats
   if (session.lastUsage) {
     const usage = session.lastUsage;
     lines.push(
-      `\n📈 Last query usage:`,
+      `\n📈 <b>Last query usage</b>:`,
       `   Input: ${usage.input_tokens?.toLocaleString() || "?"} tokens`,
       `   Output: ${usage.output_tokens?.toLocaleString() || "?"} tokens`
     );
@@ -152,18 +158,64 @@ export async function handleStatus(ctx: Context): Promise<void> {
     }
   }
 
+  // System resources
+  const memUsage = process.memoryUsage();
+  const memUsedMB = (memUsage.heapUsed / 1024 / 1024).toFixed(1);
+  const memTotalMB = (memUsage.heapTotal / 1024 / 1024).toFixed(1);
+  lines.push(
+    `\n💾 <b>Memory</b>: ${memUsedMB} / ${memTotalMB} MB`,
+    `   RSS: ${(memUsage.rss / 1024 / 1024).toFixed(1)} MB`
+  );
+
   // Error status
   if (session.lastError) {
     const ago = session.lastErrorTime
       ? Math.floor((Date.now() - session.lastErrorTime.getTime()) / 1000)
       : "?";
-    lines.push(`\n⚠️ Last error (${ago}s ago):`, `   ${session.lastError}`);
+    lines.push(
+      `\n⚠️ <b>Last error</b> (${formatDuration(ago)} ago):`,
+      `   <code>${session.lastError.slice(0, 100)}</code>`
+    );
+  } else {
+    lines.push(`\n✅ <b>Errors</b>: None`);
   }
 
   // Working directory
-  lines.push(`\n📁 Working dir: <code>${WORKING_DIR}</code>`);
+  lines.push(`\n📁 <b>Working dir</b>:\n<code>${WORKING_DIR}</code>`);
 
   await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+}
+
+/**
+ * Helper: Format uptime into human-readable string.
+ */
+function formatUptime(seconds: number): string {
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+
+  const parts = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  if (minutes > 0) parts.push(`${minutes}m`);
+  if (secs > 0 || parts.length === 0) parts.push(`${secs}s`);
+
+  return parts.join(" ");
+}
+
+/**
+ * Helper: Format duration in seconds into human-readable string.
+ */
+function formatDuration(seconds: number | string): string {
+  if (typeof seconds === "string") return seconds;
+
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+
+  const hours = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  return `${hours}h ${mins}m`;
 }
 
 /**
@@ -320,6 +372,90 @@ export async function handleSessions(ctx: Context): Promise<void> {
 }
 
 /**
+ * /health - Show system health check.
+ */
+export async function handleHealth(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  const lines: string[] = ["🏥 <b>System Health Check</b>\n"];
+
+  // Bot status
+  const botStatus = session.isRunning ? "🟢 Running" : "🟡 Idle";
+  lines.push(`Bot: ${botStatus}`);
+
+  // Session health
+  if (session.isActive) {
+    lines.push(`Session: 🟢 Active`);
+  } else {
+    lines.push(`Session: 🟡 No active session`);
+  }
+
+  // Error health
+  if (session.lastError && session.lastErrorTime) {
+    const errorAge = Date.now() - session.lastErrorTime.getTime();
+    // Recent error (< 5 min) is concerning
+    if (errorAge < 5 * 60 * 1000) {
+      lines.push(`Errors: 🔴 Recent error detected`);
+    } else {
+      lines.push(`Errors: 🟢 No recent errors`);
+    }
+  } else {
+    lines.push(`Errors: 🟢 No errors`);
+  }
+
+  // Memory health
+  const memUsage = process.memoryUsage();
+  const memUsedMB = memUsage.heapUsed / 1024 / 1024;
+  const memTotalMB = memUsage.heapTotal / 1024 / 1024;
+  const memPercent = (memUsedMB / memTotalMB) * 100;
+
+  let memStatus = "🟢";
+  if (memPercent > 90) memStatus = "🔴";
+  else if (memPercent > 70) memStatus = "🟡";
+
+  lines.push(
+    `Memory: ${memStatus} ${memPercent.toFixed(1)}% (${memUsedMB.toFixed(1)}MB)`
+  );
+
+  // Uptime health
+  const uptime = process.uptime();
+  const uptimeStr = formatUptime(uptime);
+  lines.push(`Uptime: 🟢 ${uptimeStr}`);
+
+  // Working directory check
+  try {
+    const dirExists = await Bun.file(WORKING_DIR).exists();
+    lines.push(`Working dir: ${dirExists ? "🟢" : "🔴"} ${dirExists ? "OK" : "Not found"}`);
+  } catch {
+    lines.push(`Working dir: 🔴 Error checking`);
+  }
+
+  // Overall status
+  const allGreen =
+    !session.lastError &&
+    memPercent < 70 &&
+    session.isActive;
+  lines.push(
+    `\n<b>Overall</b>: ${allGreen ? "🟢 Healthy" : "🟡 Running with warnings"}`
+  );
+
+  // Quick stats
+  lines.push(
+    `\n<b>Quick Stats</b>:`,
+    `• Process ID: <code>${process.pid}</code>`,
+    `• Node version: <code>${process.version}</code>`,
+    `• Platform: <code>${process.platform}</code>`
+  );
+
+  await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+}
+
+/**
  * /retry - Retry the last message (resume session and re-send).
  */
 export async function handleRetry(ctx: Context): Promise<void> {
@@ -359,4 +495,29 @@ export async function handleRetry(ctx: Context): Promise<void> {
   } as Context;
 
   await handleText(fakeCtx);
+}
+
+/**
+ * /health - Check bot health status.
+ */
+export async function handleHealth(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  const uptime = process.uptime();
+  const memory = process.memoryUsage();
+
+  const status = [
+    `✅ <b>Bot Health Check</b>\n`,
+    `运行时间: ${formatUptime(uptime)}`,
+    `会话状态: ${session.isActive ? "🟢 Active" : "⚪️ Idle"}`,
+    `内存使用: ${(memory.heapUsed / 1024 / 1024).toFixed(1)} MB`,
+    `工作目录: <code>${WORKING_DIR}</code>`,
+  ].join("\n");
+
+  await ctx.reply(status, { parse_mode: "HTML" });
 }
