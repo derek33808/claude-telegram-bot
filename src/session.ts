@@ -31,6 +31,7 @@ import type {
   SessionHistory,
   StatusCallback,
   TokenUsage,
+  ClaudeCodeSession,
 } from "./types";
 
 /**
@@ -587,6 +588,61 @@ class ClaudeSession {
     }
 
     return this.resumeSession(sessions[0]!.session_id);
+  }
+
+  /**
+   * Get list of Claude Code sessions from ~/.claude/projects/
+   */
+  getClaudeCodeSessions(): ClaudeCodeSession[] {
+    try {
+      // Convert working directory to Claude's project path format
+      // Claude replaces both / and _ with -
+      const projectPathEncoded = WORKING_DIR.replace(/[/_]/g, "-");
+      const sessionsIndexPath = `${process.env.HOME}/.claude/projects/${projectPathEncoded}/sessions-index.json`;
+      console.log(`Looking for sessions at: ${sessionsIndexPath}`);
+
+      const file = Bun.file(sessionsIndexPath);
+      if (!file.size) {
+        return [];
+      }
+
+      const text = readFileSync(sessionsIndexPath, "utf-8");
+      const data = JSON.parse(text) as { version: number; entries: ClaudeCodeSession[] };
+
+      // Filter active sessions (not sidechains), sort by modified time (newest first)
+      return data.entries
+        .filter(s => !s.isSidechain && s.messageCount > 0)
+        .sort((a, b) => new Date(b.modified).getTime() - new Date(a.modified).getTime())
+        .slice(0, 10); // Return top 10
+    } catch (error) {
+      console.warn("Failed to load Claude Code sessions:", error);
+      return [];
+    }
+  }
+
+  /**
+   * Resume a Claude Code session by ID.
+   */
+  resumeClaudeCodeSession(sessionId: string): [success: boolean, message: string] {
+    const sessions = this.getClaudeCodeSessions();
+    const sessionData = sessions.find((s) => s.sessionId === sessionId);
+
+    if (!sessionData) {
+      return [false, "Claude Code session not found"];
+    }
+
+    this.sessionId = sessionData.sessionId;
+    this.conversationTitle = sessionData.summary || sessionData.firstPrompt?.slice(0, 50);
+    this.lastActivity = new Date();
+
+    console.log(
+      `Resumed Claude Code session ${sessionData.sessionId.slice(0, 8)}... - "${this.conversationTitle}"`
+    );
+
+    return [
+      true,
+      `已接管会话: "${this.conversationTitle}"`,
+    ];
   }
 }
 

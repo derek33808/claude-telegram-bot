@@ -30,6 +30,21 @@ export interface SessionHistory {
   sessions: SavedSession[];
 }
 
+// Claude Code session from sessions-index.json
+export interface ClaudeCodeSession {
+  sessionId: string;
+  fullPath: string;
+  fileMtime: number;
+  firstPrompt: string;
+  summary: string;
+  messageCount: number;
+  created: string;
+  modified: string;
+  gitBranch?: string;
+  projectPath: string;
+  isSidechain: boolean;
+}
+
 // Token usage from Claude
 export interface TokenUsage {
   input_tokens: number;

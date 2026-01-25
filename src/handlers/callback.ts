@@ -5,7 +5,7 @@
  */
 
 import type { Context } from "grammy";
-import { unlinkSync } from "fs";
+import { unlinkSync, writeFileSync, readFileSync, existsSync } from "fs";
 import { session } from "../session";
 import { ALLOWED_USERS } from "../config";
 import { isAuthorized } from "../security";
@@ -35,6 +35,18 @@ export async function handleCallback(ctx: Context): Promise<void> {
   // 2. Handle resume callbacks: resume:{session_id}
   if (callbackData.startsWith("resume:")) {
     await handleResumeCallback(ctx, callbackData);
+    return;
+  }
+
+  // 2.5. Handle Claude Code session callbacks: ccsession:{session_id}
+  if (callbackData.startsWith("ccsession:")) {
+    await handleClaudeCodeSessionCallback(ctx, callbackData);
+    return;
+  }
+
+  // 2.6. Handle hook Allow/Deny callbacks: hook:allow:{request_id} or hook:deny:{request_id}
+  if (callbackData.startsWith("hook:")) {
+    await handleHookCallback(ctx, callbackData);
     return;
   }
 
@@ -213,5 +225,132 @@ async function handleResumeCallback(
     // Don't show error to user - session is still resumed, recap just failed
   } finally {
     typing.stop();
+  }
+}
+
+/**
+ * Handle Claude Code session callback (ccsession:{session_id}).
+ */
+async function handleClaudeCodeSessionCallback(
+  ctx: Context,
+  callbackData: string
+): Promise<void> {
+  const userId = ctx.from?.id;
+  const username = ctx.from?.username || "unknown";
+  const chatId = ctx.chat?.id;
+  const sessionId = callbackData.replace("ccsession:", "");
+
+  if (!sessionId || !userId || !chatId) {
+    await ctx.answerCallbackQuery({ text: "无效的会话 ID" });
+    return;
+  }
+
+  // Check if session is already active
+  if (session.isActive) {
+    await ctx.answerCallbackQuery({ text: "已有活动会话，请先使用 /new 清除" });
+    return;
+  }
+
+  // Resume the selected Claude Code session
+  const [success, message] = session.resumeClaudeCodeSession(sessionId);
+
+  if (!success) {
+    await ctx.answerCallbackQuery({ text: message, show_alert: true });
+    return;
+  }
+
+  // Update the original message to show selection
+  try {
+    await ctx.editMessageText(`✅ ${message}`);
+  } catch (error) {
+    console.debug("Failed to edit session message:", error);
+  }
+  await ctx.answerCallbackQuery({ text: "会话已接管!" });
+
+  // Send a recap prompt to Claude
+  const recapPrompt =
+    "请用中文简要总结一下我们当前对话的进度和上下文，帮我回忆一下。最多2-3句话。";
+
+  const typing = startTypingIndicator(ctx);
+  const state = new StreamingState();
+  const statusCallback = createStatusCallback(ctx, state);
+
+  try {
+    await session.sendMessageStreaming(
+      recapPrompt,
+      username,
+      userId,
+      statusCallback,
+      chatId,
+      ctx
+    );
+  } catch (error) {
+    console.error("Error getting recap:", error);
+    // Don't show error to user - session is still taken over, recap just failed
+  } finally {
+    typing.stop();
+  }
+}
+
+/**
+ * Handle hook Allow/Deny callback (hook:allow:{request_id} or hook:deny:{request_id}).
+ */
+async function handleHookCallback(
+  ctx: Context,
+  callbackData: string
+): Promise<void> {
+  const parts = callbackData.split(":");
+  if (parts.length !== 3) {
+    await ctx.answerCallbackQuery({ text: "无效的回调数据" });
+    return;
+  }
+
+  const action = parts[1] as string; // "allow" or "deny"
+  const requestId = parts[2] as string;
+
+  if (!["allow", "deny"].includes(action)) {
+    await ctx.answerCallbackQuery({ text: "无效的操作" });
+    return;
+  }
+
+  // Update the pending request file
+  const pendingDir = "/tmp/claude-telegram-hooks";
+  const requestFile = `${pendingDir}/${requestId}.json`;
+
+  try {
+    if (!existsSync(requestFile)) {
+      await ctx.answerCallbackQuery({ text: "请求已过期或不存在", show_alert: true });
+      return;
+    }
+
+    // Read current data
+    const data = JSON.parse(readFileSync(requestFile, "utf-8"));
+
+    // Update status
+    data.status = action;
+    data.responded_at = Date.now();
+
+    // Write back
+    writeFileSync(requestFile, JSON.stringify(data));
+
+    // Update message
+    const actionText = action === "allow" ? "✅ 已允许" : "❌ 已拒绝";
+    try {
+      await ctx.editMessageText(
+        `${actionText}\n\n<i>工具: ${data.tool || "unknown"}</i>`,
+        { parse_mode: "HTML" }
+      );
+    } catch (error) {
+      console.debug("Failed to edit hook message:", error);
+    }
+
+    await ctx.answerCallbackQuery({
+      text: action === "allow" ? "操作已允许" : "操作已拒绝"
+    });
+
+    console.log(`Hook response: ${action} for request ${requestId}`);
+  } catch (error) {
+    console.error("Error handling hook callback:", error);
+    await ctx.answerCallbackQuery({ text: "处理响应时出错", show_alert: true });
   }
 }

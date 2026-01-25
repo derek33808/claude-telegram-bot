@@ -26,19 +26,20 @@ export async function handleStart(ctx: Context): Promise<void> {
 
   await ctx.reply(
     `🤖 <b>Claude Telegram Bot</b>\n\n` +
-      `Status: ${status}\n` +
-      `Working directory: <code>${workDir}</code>\n\n` +
-      `<b>Commands:</b>\n` +
-      `/new - Start fresh session\n` +
-      `/stop - Stop current query\n` +
-      `/status - Show detailed status\n` +
-      `/resume - Resume last session\n` +
-      `/retry - Retry last message\n` +
-      `/restart - Restart the bot\n\n` +
-      `<b>Tips:</b>\n` +
-      `• Prefix with <code>!</code> to interrupt current query\n` +
-      `• Use "think" keyword for extended reasoning\n` +
-      `• Send photos, voice, or documents`,
+      `状态: ${status}\n` +
+      `工作目录: <code>${workDir}</code>\n\n` +
+      `<b>命令:</b>\n` +
+      `/new - 开始新对话\n` +
+      `/stop - 中断当前查询\n` +
+      `/status - 查看详细状态\n` +
+      `/resume - 恢复 Bot 会话\n` +
+      `/sessions - 接管终端会话\n` +
+      `/retry - 重试上条消息\n` +
+      `/restart - 重启机器人\n\n` +
+      `<b>提示:</b>\n` +
+      `• 用 <code>!</code> 前缀可中断当前查询\n` +
+      `• 使用"思考"关键词触发深度推理\n` +
+      `• 支持发送图片、语音、文档`,
     { parse_mode: "HTML" }
   );
 }
@@ -257,6 +258,65 @@ export async function handleRestart(ctx: Context): Promise<void> {
 
   // Exit - launchd will restart us
   process.exit(0);
+}
+
+/**
+ * /sessions - List Claude Code sessions to take over.
+ */
+export async function handleSessions(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  // Get Claude Code sessions
+  const sessions = session.getClaudeCodeSessions();
+
+  if (sessions.length === 0) {
+    await ctx.reply("❌ 没有找到 Claude Code 会话。");
+    return;
+  }
+
+  // Build inline keyboard with session list
+  const buttons = sessions.map((s) => {
+    // Format date: "01/25 10:30"
+    const date = new Date(s.modified);
+    const dateStr = date.toLocaleDateString("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+    });
+    const timeStr = date.toLocaleTimeString("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    // Truncate summary for button (max ~35 chars to fit)
+    const summaryPreview = s.summary
+      ? s.summary.length > 30
+        ? s.summary.slice(0, 27) + "..."
+        : s.summary
+      : s.firstPrompt?.slice(0, 27) + "..." || "无标题";
+
+    return [
+      {
+        text: `📅 ${dateStr} ${timeStr} - ${summaryPreview}`,
+        callback_data: `ccsession:${s.sessionId}`,
+      },
+    ];
+  });
+
+  await ctx.reply(
+    "🖥️ <b>Claude Code 会话列表</b>\n\n" +
+      "选择一个会话来接管（将继承该会话的完整上下文）：",
+    {
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: buttons,
+      },
+    }
+  );
 }
 
 /**
