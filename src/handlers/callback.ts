@@ -44,6 +44,12 @@ export async function handleCallback(ctx: Context): Promise<void> {
     return;
   }
 
+  // 2.5.1. Handle tmux session callbacks: tmux:{session_name}
+  if (callbackData.startsWith("tmux:")) {
+    await handleTmuxSessionCallback(ctx, callbackData);
+    return;
+  }
+
   // 2.6. Handle hook Allow/Deny callbacks: hook:allow:{request_id} or hook:deny:{request_id}
   if (callbackData.startsWith("hook:")) {
     await handleHookCallback(ctx, callbackData);
@@ -223,6 +229,64 @@ async function handleResumeCallback(
   } catch (error) {
     console.error("Error getting recap:", error);
     // Don't show error to user - session is still resumed, recap just failed
+  } finally {
+    typing.stop();
+  }
+}
+
+/**
+ * Handle tmux session callback (tmux:{session_name}).
+ */
+async function handleTmuxSessionCallback(
+  ctx: Context,
+  callbackData: string
+): Promise<void> {
+  const userId = ctx.from?.id;
+  const username = ctx.from?.username || "unknown";
+  const chatId = ctx.chat?.id;
+  const sessionName = callbackData.replace("tmux:", "");
+
+  if (!sessionName || !userId || !chatId) {
+    await ctx.answerCallbackQuery({ text: "无效的会话名" });
+    return;
+  }
+
+  // Attach to the selected tmux session
+  const [success, message] = await session.attachTmuxSession(sessionName);
+
+  if (!success) {
+    await ctx.answerCallbackQuery({ text: message, show_alert: true });
+    return;
+  }
+
+  // Update the original message to show selection
+  try {
+    await ctx.editMessageText(`✅ ${message}`);
+  } catch (error) {
+    console.debug("Failed to edit tmux session message:", error);
+  }
+  await ctx.answerCallbackQuery({ text: "已接管 tmux 会话!" });
+
+  // Send a recap prompt to Claude
+  const recapPrompt =
+    "请用中文简要总结一下我们当前对话的进度和上下文，帮我回忆一下。最多2-3句话。";
+
+  const typing = startTypingIndicator(ctx);
+  const state = new StreamingState();
+  const statusCallback = createStatusCallback(ctx, state);
+
+  try {
+    await session.sendMessageStreaming(
+      recapPrompt,
+      username,
+      userId,
+      statusCallback,
+      chatId,
+      ctx
+    );
+  } catch (error) {
+    console.error("Error getting recap:", error);
+    // Don't show error to user - session is still taken over, recap just failed
   } finally {
     typing.stop();
   }

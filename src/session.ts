@@ -28,7 +28,9 @@ import {
   THINKING_KEYWORDS,
   WORKING_DIR,
   DB_PATH,
+  TMUX_ENABLED,
 } from "./config";
+import { TmuxBridge, type TmuxSession } from "./tmux";
 import { formatToolStatus } from "./formatting";
 import { checkPendingAskUserRequests } from "./handlers/streaming";
 import { checkCommandSafety, isPathAllowed } from "./security";
@@ -97,6 +99,10 @@ class ClaudeSession {
   lastMessage: string | null = null;
   conversationTitle: string | null = null;
 
+  // Tmux bridge for persistent session mode
+  private tmuxBridge: TmuxBridge | null = null;
+  private tmuxSession: TmuxSession | null = null;
+
   // Current user context
   private currentUserId: number | null = null;
   private currentUsername: string | null = null;
@@ -108,11 +114,74 @@ class ClaudeSession {
   private _wasInterruptedByNewMessage = false;
 
   get isActive(): boolean {
+    // In tmux mode, check tmux session instead of sessionId
+    if (TMUX_ENABLED && this.tmuxSession) {
+      return this.tmuxSession.isRunning;
+    }
     return this.sessionId !== null;
   }
 
   get isRunning(): boolean {
+    // In tmux mode, check tmux bridge status
+    if (TMUX_ENABLED && this.tmuxBridge) {
+      return this.tmuxBridge.getStatus().isResponding;
+    }
     return this.isQueryRunning || this._isProcessing;
+  }
+
+  /**
+   * Get or create the TmuxBridge instance.
+   */
+  private getTmuxBridge(): TmuxBridge {
+    if (!this.tmuxBridge) {
+      this.tmuxBridge = new TmuxBridge({ workingDir: WORKING_DIR });
+    }
+    return this.tmuxBridge;
+  }
+
+  /**
+   * Get current tmux session info (for /status command).
+   */
+  getTmuxStatus(): { enabled: boolean; session: TmuxSession | null; isResponding: boolean } {
+    if (!TMUX_ENABLED) {
+      return { enabled: false, session: null, isResponding: false };
+    }
+    if (!this.tmuxBridge) {
+      return { enabled: true, session: null, isResponding: false };
+    }
+    const status = this.tmuxBridge.getStatus();
+    return {
+      enabled: true,
+      session: status.session,
+      isResponding: status.isResponding,
+    };
+  }
+
+  /**
+   * List available tmux sessions (for /sessions command).
+   */
+  async listTmuxSessions(): Promise<TmuxSession[]> {
+    if (!TMUX_ENABLED) {
+      return [];
+    }
+    const bridge = this.getTmuxBridge();
+    return bridge.listSessions();
+  }
+
+  /**
+   * Attach to an existing tmux session (takeover mode).
+   */
+  async attachTmuxSession(sessionName: string): Promise<[boolean, string]> {
+    if (!TMUX_ENABLED) {
+      return [false, "Tmux bridge is not enabled"];
+    }
+    try {
+      const bridge = this.getTmuxBridge();
+      this.tmuxSession = await bridge.attachToSession(sessionName);
+      return [true, `Attached to session: ${sessionName}`];
+    } catch (error) {
+      return [false, `Failed to attach: ${error}`];
+    }
   }
 
   /**
@@ -159,6 +228,16 @@ class ClaudeSession {
    * Returns: "stopped" if query was aborted, "pending" if processing will be cancelled, false if nothing running
    */
   async stop(): Promise<"stopped" | "pending" | false> {
+    // In tmux mode, send Ctrl+C to stop current response
+    if (TMUX_ENABLED && this.tmuxBridge) {
+      const status = this.tmuxBridge.getStatus();
+      if (status.isResponding) {
+        await this.tmuxBridge.stopResponse();
+        console.log("Stop requested - sent Ctrl+C to tmux session");
+        return "stopped";
+      }
+    }
+
     // If a query is actively running, abort it
     if (this.isQueryRunning && this.abortController) {
       this.stopRequested = true;
@@ -208,6 +287,11 @@ class ClaudeSession {
     }
 
     try {
+      // Route to tmux bridge if enabled
+      if (TMUX_ENABLED) {
+        return await this._sendMessageViaTmux(message, statusCallback);
+      }
+
       return await this._sendMessageStreamingInternal(
         message,
         username,
@@ -220,6 +304,74 @@ class ClaudeSession {
       // Always release lock when done
       store.releaseLock(userId);
       store.updateState(userId, { is_processing: false, current_tool: null });
+    }
+  }
+
+  /**
+   * Send message via tmux bridge (persistent session mode).
+   */
+  private async _sendMessageViaTmux(
+    message: string,
+    statusCallback: StatusCallback
+  ): Promise<string> {
+    const bridge = this.getTmuxBridge();
+
+    // Create or ensure we have an active tmux session
+    if (!bridge.getCurrentSession()) {
+      console.log("Creating new tmux session for Claude Code...");
+      await statusCallback("tool", "Starting Claude Code session...");
+
+      // Resume last session if we have a sessionId, otherwise create new
+      this.tmuxSession = await bridge.createSession(
+        undefined,
+        this.sessionId || undefined
+      );
+
+      console.log(`Tmux session created: ${this.tmuxSession.sessionName}`);
+    }
+
+    // Update processing state
+    if (this.currentUserId) {
+      store.updateState(this.currentUserId, { is_processing: true });
+    }
+
+    try {
+      // Send message via tmux
+      const response = await bridge.sendMessage(message, statusCallback);
+
+      // Update activity tracking
+      this.lastActivity = new Date();
+      this.lastMessage = message;
+
+      // Save to database if we have user context
+      if (this.currentUserId && this.tmuxSession) {
+        const now = new Date().toISOString();
+
+        // Use tmux session name as a pseudo session ID for tracking
+        const tmuxSessionId = `tmux-${this.tmuxSession.sessionName}`;
+
+        store.saveMessage({
+          session_id: tmuxSessionId,
+          role: "user",
+          content: message,
+          created_at: now,
+        });
+
+        if (response) {
+          store.saveMessage({
+            session_id: tmuxSessionId,
+            role: "assistant",
+            content: response,
+            created_at: now,
+          });
+        }
+      }
+
+      return response || "No response from Claude.";
+    } finally {
+      if (this.currentUserId) {
+        store.updateState(this.currentUserId, { is_processing: false, current_tool: null });
+      }
     }
   }
 
@@ -575,8 +727,16 @@ class ClaudeSession {
 
   /**
    * Kill the current session (clear session_id).
+   * In tmux mode, marks session for cleanup based on creation type.
    */
   async kill(): Promise<void> {
+    // In tmux mode, mark session for exit (triggers cleanup based on creation type)
+    if (TMUX_ENABLED && this.tmuxBridge) {
+      this.tmuxBridge.markForExit();
+      this.tmuxSession = null;
+      console.log("Tmux session marked for exit");
+    }
+
     // Deactivate in database (for multi-device sync)
     if (this.currentUserId) {
       store.deactivateUserSessions(this.currentUserId);
@@ -586,6 +746,28 @@ class ClaudeSession {
     this.lastActivity = null;
     this.conversationTitle = null;
     console.log("Session cleared");
+  }
+
+  /**
+   * Kill a specific tmux session by name.
+   */
+  async killTmuxSession(sessionName: string): Promise<[boolean, string]> {
+    if (!TMUX_ENABLED) {
+      return [false, "Tmux bridge is not enabled"];
+    }
+    try {
+      const bridge = this.getTmuxBridge();
+      await bridge.killSession(sessionName);
+
+      // Clear current session if it was the one killed
+      if (this.tmuxSession?.sessionName === sessionName) {
+        this.tmuxSession = null;
+      }
+
+      return [true, `Session ${sessionName} killed`];
+    } catch (error) {
+      return [false, `Failed to kill session: ${error}`];
+    }
   }
 
   /**

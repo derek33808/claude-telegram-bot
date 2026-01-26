@@ -1,0 +1,634 @@
+/**
+ * TmuxBridge - Core class for tmux-based Claude Code interaction.
+ *
+ * Manages tmux sessions, sends messages, captures output, and converts
+ * terminal output to structured events for Telegram.
+ */
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import type {
+  TmuxSession,
+  TmuxBridgeConfig,
+  TmuxLock,
+  TmuxBridgeStatus,
+  StatusCallback,
+} from "./types";
+import {
+  getDefaultConfig,
+  TMUX_DATA_DIR,
+  TMUX_LOCK_FILE,
+  TMUX_SESSION_FILE,
+  TMUX_LOCK_TIMEOUT,
+  TMUX_IDLE_TIMEOUT,
+} from "./config";
+import { TerminalOutputParser } from "./parser";
+
+/**
+ * TmuxBridge manages Claude Code sessions via tmux.
+ */
+export class TmuxBridge {
+  private config: TmuxBridgeConfig;
+  private currentSession: TmuxSession | null = null;
+  private pollAbortController: AbortController | null = null;
+  private cleanupTimers: Map<string, NodeJS.Timeout> = new Map();
+
+  constructor(config: Partial<TmuxBridgeConfig> & { workingDir: string }) {
+    this.config = {
+      ...getDefaultConfig(config.workingDir),
+      ...config,
+    };
+
+    // Ensure data directory exists
+    if (!existsSync(TMUX_DATA_DIR)) {
+      mkdirSync(TMUX_DATA_DIR, { recursive: true });
+    }
+  }
+
+  // ==================== Session Management ====================
+
+  /**
+   * Create a new tmux session with Claude Code.
+   *
+   * @param sessionName - Optional custom session name
+   * @param resumeSessionId - Optional Claude session ID to resume
+   * @returns The created TmuxSession
+   */
+  async createSession(
+    sessionName?: string,
+    resumeSessionId?: string
+  ): Promise<TmuxSession> {
+    const name = sessionName || `${this.config.sessionPrefix}-${Date.now()}`;
+
+    // Build claude command
+    let claudeCmd = this.config.claudePath;
+    if (resumeSessionId) {
+      claudeCmd += ` --resume ${resumeSessionId}`;
+    }
+
+    // Create tmux session with claude running
+    await this.executeTmux([
+      "new-session",
+      "-d", // Detached
+      "-s", name, // Session name
+      "-c", this.config.workingDir, // Working directory
+      "-x", "200", // Width
+      "-y", "50", // Height
+      claudeCmd, // Command to run
+    ]);
+
+    // Set history limit
+    await this.executeTmux([
+      "set-option",
+      "-t", name,
+      "history-limit", String(this.config.historyLimit),
+    ]);
+
+    // Wait for Claude to initialize
+    await Bun.sleep(2000);
+
+    // Create session object
+    this.currentSession = {
+      sessionName: name,
+      windowId: "0",
+      paneId: "0",
+      workingDir: this.config.workingDir,
+      isRunning: true,
+      createdBy: "telegram",
+      isOwned: true,
+      markedForExit: false,
+      lastActivity: new Date(),
+    };
+
+    // Save session metadata
+    this.saveSessionMetadata();
+
+    console.log(`Created tmux session: ${name}`);
+    return this.currentSession;
+  }
+
+  /**
+   * Attach to an existing tmux session.
+   *
+   * @param sessionName - Name of the session to attach to
+   * @returns The attached TmuxSession
+   */
+  async attachToSession(sessionName: string): Promise<TmuxSession> {
+    // Verify session exists
+    const sessions = await this.listSessions();
+    const target = sessions.find((s) => s.sessionName === sessionName);
+
+    if (!target) {
+      throw new Error(`Session not found: ${sessionName}`);
+    }
+
+    // Update ownership
+    target.isOwned = true;
+    target.lastActivity = new Date();
+    this.currentSession = target;
+
+    // Save metadata
+    this.saveSessionMetadata();
+
+    console.log(`Attached to tmux session: ${sessionName}`);
+    return this.currentSession;
+  }
+
+  /**
+   * List all tmux sessions (both telegram-created and CLI).
+   */
+  async listSessions(): Promise<TmuxSession[]> {
+    try {
+      const output = await this.executeTmux([
+        "list-sessions",
+        "-F",
+        "#{session_name}:#{window_id}:#{pane_id}:#{pane_current_path}:#{pane_pid}",
+      ]);
+
+      const sessions: TmuxSession[] = [];
+      const savedMetadata = this.loadSessionMetadata();
+
+      for (const line of output.trim().split("\n").filter(Boolean)) {
+        const [sessionName, windowId, paneId, path] = line.split(":");
+        if (!sessionName) continue;
+
+        // Check if this is a Claude-related session
+        const isClaudeSession =
+          sessionName.startsWith(this.config.sessionPrefix) ||
+          sessionName.includes("claude");
+
+        if (!isClaudeSession) continue;
+
+        // Get saved metadata or create default
+        const saved = savedMetadata[sessionName];
+
+        sessions.push({
+          sessionName,
+          windowId: windowId || "0",
+          paneId: paneId || "0",
+          workingDir: path || this.config.workingDir,
+          isRunning: true,
+          createdBy: saved?.createdBy || "cli",
+          isOwned: saved?.isOwned || false,
+          markedForExit: saved?.markedForExit || false,
+          markedAt: saved?.markedAt ? new Date(saved.markedAt) : undefined,
+          lastActivity: saved?.lastActivity
+            ? new Date(saved.lastActivity)
+            : new Date(),
+        });
+      }
+
+      return sessions;
+    } catch {
+      // No sessions or tmux not running
+      return [];
+    }
+  }
+
+  /**
+   * Kill a tmux session.
+   */
+  async killSession(sessionName: string): Promise<void> {
+    try {
+      await this.executeTmux(["kill-session", "-t", sessionName]);
+      console.log(`Killed tmux session: ${sessionName}`);
+
+      // Clear current session if it was killed
+      if (this.currentSession?.sessionName === sessionName) {
+        this.currentSession = null;
+      }
+
+      // Remove from metadata
+      const metadata = this.loadSessionMetadata();
+      delete metadata[sessionName];
+      this.saveSessionMetadataRaw(metadata);
+
+      // Clear cleanup timer
+      const timer = this.cleanupTimers.get(sessionName);
+      if (timer) {
+        clearTimeout(timer);
+        this.cleanupTimers.delete(sessionName);
+      }
+    } catch (error) {
+      console.warn(`Failed to kill session ${sessionName}:`, error);
+    }
+  }
+
+  /**
+   * Get current session.
+   */
+  getCurrentSession(): TmuxSession | null {
+    return this.currentSession;
+  }
+
+  // ==================== Message Handling ====================
+
+  /**
+   * Send a message to Claude Code via tmux.
+   *
+   * @param message - The user message to send
+   * @param statusCallback - Callback for streaming status updates
+   * @returns The final response text
+   */
+  async sendMessage(
+    message: string,
+    statusCallback: StatusCallback
+  ): Promise<string> {
+    if (!this.currentSession) {
+      throw new Error("No active tmux session");
+    }
+
+    // Acquire lock
+    const lock = await this.acquireLock(this.currentSession.sessionName);
+    if (!lock) {
+      throw new Error("Failed to acquire lock - another operation in progress");
+    }
+
+    try {
+      // Get baseline output length before sending
+      const baselineOutput = await this.capturePane();
+      const baselineLength = baselineOutput.length;
+
+      // Send the message
+      await this.sendKeys(message);
+      await this.sendKeys("Enter");
+
+      // Update activity
+      this.currentSession.lastActivity = new Date();
+      this.saveSessionMetadata();
+
+      // Wait a moment for Claude to start processing
+      await Bun.sleep(500);
+
+      // Create parser and poll for response
+      // Pass baseline length so parser knows where to start looking for new content
+      const parser = new TerminalOutputParser();
+      return await this.pollForResponse(parser, statusCallback, baselineLength);
+    } finally {
+      // Always release lock
+      this.releaseLock(this.currentSession.sessionName);
+    }
+  }
+
+  /**
+   * Stop the current response (send Ctrl+C).
+   */
+  async stopResponse(): Promise<void> {
+    if (!this.currentSession) return;
+
+    // Abort polling
+    if (this.pollAbortController) {
+      this.pollAbortController.abort();
+    }
+
+    // Send Ctrl+C
+    await this.executeTmux([
+      "send-keys",
+      "-t",
+      `${this.currentSession.sessionName}:${this.currentSession.windowId}.${this.currentSession.paneId}`,
+      "C-c",
+    ]);
+
+    console.log("Sent Ctrl+C to tmux session");
+  }
+
+  /**
+   * Mark session for exit (will be cleaned up after timeout).
+   */
+  markForExit(): void {
+    if (!this.currentSession) return;
+
+    // Only mark telegram-created sessions for auto-cleanup
+    if (this.currentSession.createdBy === "telegram") {
+      this.currentSession.markedForExit = true;
+      this.currentSession.markedAt = new Date();
+      this.currentSession.isOwned = false;
+      this.saveSessionMetadata();
+
+      // Schedule cleanup
+      const sessionName = this.currentSession.sessionName;
+      console.log(
+        `Session ${sessionName} marked for exit, will cleanup in ${TMUX_IDLE_TIMEOUT / 1000}s`
+      );
+
+      const timer = setTimeout(async () => {
+        await this.cleanupSession(sessionName);
+      }, TMUX_IDLE_TIMEOUT);
+
+      this.cleanupTimers.set(sessionName, timer);
+    } else {
+      // CLI session - just release ownership
+      this.currentSession.isOwned = false;
+      this.saveSessionMetadata();
+      console.log(`Released control of CLI session: ${this.currentSession.sessionName}`);
+    }
+
+    this.currentSession = null;
+  }
+
+  /**
+   * Cleanup a marked session if it's still marked.
+   */
+  private async cleanupSession(sessionName: string): Promise<void> {
+    const sessions = await this.listSessions();
+    const session = sessions.find((s) => s.sessionName === sessionName);
+
+    if (session?.markedForExit) {
+      console.log(`Auto-cleaning up session: ${sessionName}`);
+      await this.killSession(sessionName);
+    }
+
+    this.cleanupTimers.delete(sessionName);
+  }
+
+  // ==================== Internal Methods ====================
+
+  /**
+   * Execute a tmux command.
+   */
+  private async executeTmux(args: string[]): Promise<string> {
+    const proc = Bun.spawn([this.config.tmuxPath, ...args], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const output = await new Response(proc.stdout).text();
+    const exitCode = await proc.exited;
+
+    if (exitCode !== 0) {
+      const stderr = await new Response(proc.stderr).text();
+      throw new Error(`tmux ${args[0]} failed: ${stderr || output}`);
+    }
+
+    return output;
+  }
+
+  /**
+   * Send keys to tmux pane.
+   */
+  private async sendKeys(text: string): Promise<void> {
+    if (!this.currentSession) return;
+
+    const target = `${this.currentSession.sessionName}:${this.currentSession.windowId}.${this.currentSession.paneId}`;
+
+    if (text === "Enter") {
+      await this.executeTmux(["send-keys", "-t", target, "Enter"]);
+    } else {
+      // For regular text, use literal flag to avoid interpretation
+      await this.executeTmux(["send-keys", "-t", target, "-l", text]);
+    }
+  }
+
+  /**
+   * Capture tmux pane content.
+   */
+  private async capturePane(historyLines?: number): Promise<string> {
+    if (!this.currentSession) return "";
+
+    const target = `${this.currentSession.sessionName}:${this.currentSession.windowId}.${this.currentSession.paneId}`;
+    const lines = historyLines || this.config.historyLimit;
+
+    const output = await this.executeTmux([
+      "capture-pane",
+      "-t", target,
+      "-p", // Print to stdout
+      "-S", `-${lines}`, // Start from N lines ago
+    ]);
+
+    return output;
+  }
+
+  /**
+   * Poll for response completion.
+   *
+   * State machine:
+   * 1. Wait for processing indicator (✽) - Claude started
+   * 2. Wait for response (⏺) and completion (❯ alone)
+   */
+  private async pollForResponse(
+    parser: TerminalOutputParser,
+    statusCallback: StatusCallback,
+    _baselineLength?: number
+  ): Promise<string> {
+    const startTime = Date.now();
+    let lastOutput = "";
+    let sawProcessing = false;
+    let sawResponse = false;
+
+    this.pollAbortController = new AbortController();
+
+    try {
+      while (true) {
+        // Check timeout
+        if (Date.now() - startTime > this.config.maxPollTimeMs) {
+          throw new Error("Response timeout");
+        }
+
+        // Check abort
+        if (this.pollAbortController.signal.aborted) {
+          throw new Error("Response cancelled");
+        }
+
+        // Capture current pane content
+        const paneContent = await this.capturePane();
+
+        // Only process if content changed
+        if (paneContent !== lastOutput) {
+          lastOutput = paneContent;
+
+          // Check for processing indicator (Claude started working)
+          if (!sawProcessing && paneContent.includes("✽")) {
+            sawProcessing = true;
+            console.log("Claude is processing...");
+            await statusCallback("thinking", "Processing...");
+          }
+
+          // Check for response indicator (Claude responding)
+          // This may appear before or without the processing indicator for fast responses
+          if (!sawResponse && paneContent.includes("⏺")) {
+            sawResponse = true;
+            console.log("Claude is responding...");
+            // IMPORTANT: Reset parser when we see response to ensure we capture it
+            // The response might already be in content that was "processed" before
+            parser.reset();
+          }
+
+          // Only start parsing after we've seen either processing or response
+          if (sawProcessing || sawResponse) {
+            // Feed to parser
+            const blocks = parser.feed(paneContent);
+
+            // Emit callbacks for each block
+            for (const block of blocks) {
+              await this.emitStatusCallback(block, statusCallback);
+            }
+
+            // Check completion only after we've seen the response
+            if (sawResponse && parser.isComplete()) {
+              const response = parser.getTextResponse();
+              console.log(`Response complete. Text: "${response.slice(0, 100)}"`);
+              await statusCallback("done", "");
+              return response;
+            }
+          }
+        }
+
+        // Wait before next poll
+        await Bun.sleep(this.config.pollIntervalMs);
+      }
+    } finally {
+      this.pollAbortController = null;
+    }
+  }
+
+  /**
+   * Emit status callback based on parsed block.
+   */
+  private async emitStatusCallback(
+    block: { type: string; content: string },
+    statusCallback: StatusCallback
+  ): Promise<void> {
+    switch (block.type) {
+      case "thinking":
+        await statusCallback("thinking", block.content);
+        break;
+      case "tool":
+        await statusCallback("tool", block.content);
+        break;
+      case "text":
+        if (block.content.trim()) {
+          await statusCallback("text", block.content, 0);
+        }
+        break;
+      case "error":
+        await statusCallback("tool", `Error: ${block.content}`);
+        break;
+      case "prompt":
+        // Prompt detected, response should be complete soon
+        break;
+    }
+  }
+
+  // ==================== Lock Management ====================
+
+  /**
+   * Acquire lock for a session.
+   */
+  private async acquireLock(sessionName: string): Promise<TmuxLock | null> {
+    const locks = this.loadLocks();
+
+    // Check for existing valid lock
+    const existing = locks[sessionName];
+    if (existing && new Date(existing.expiresAt) > new Date()) {
+      return null; // Lock held by someone else
+    }
+
+    // Create new lock
+    const lock: TmuxLock = {
+      sessionName,
+      acquiredAt: new Date(),
+      expiresAt: new Date(Date.now() + TMUX_LOCK_TIMEOUT),
+      deviceInfo: "telegram-bot",
+    };
+
+    locks[sessionName] = lock;
+    this.saveLocks(locks);
+
+    return lock;
+  }
+
+  /**
+   * Release lock for a session.
+   */
+  private releaseLock(sessionName: string): void {
+    const locks = this.loadLocks();
+    delete locks[sessionName];
+    this.saveLocks(locks);
+  }
+
+  /**
+   * Load locks from file.
+   */
+  private loadLocks(): Record<string, TmuxLock> {
+    try {
+      if (existsSync(TMUX_LOCK_FILE)) {
+        return JSON.parse(readFileSync(TMUX_LOCK_FILE, "utf-8"));
+      }
+    } catch {
+      // Ignore errors
+    }
+    return {};
+  }
+
+  /**
+   * Save locks to file.
+   */
+  private saveLocks(locks: Record<string, TmuxLock>): void {
+    writeFileSync(TMUX_LOCK_FILE, JSON.stringify(locks, null, 2));
+  }
+
+  // ==================== Session Metadata ====================
+
+  /**
+   * Save current session metadata.
+   */
+  private saveSessionMetadata(): void {
+    if (!this.currentSession) return;
+
+    const metadata = this.loadSessionMetadata();
+    metadata[this.currentSession.sessionName] = {
+      createdBy: this.currentSession.createdBy,
+      isOwned: this.currentSession.isOwned,
+      markedForExit: this.currentSession.markedForExit,
+      markedAt: this.currentSession.markedAt?.toISOString(),
+      lastActivity: this.currentSession.lastActivity.toISOString(),
+    };
+    this.saveSessionMetadataRaw(metadata);
+  }
+
+  /**
+   * Load session metadata from file.
+   */
+  private loadSessionMetadata(): Record<string, {
+    createdBy: "telegram" | "cli";
+    isOwned: boolean;
+    markedForExit: boolean;
+    markedAt?: string;
+    lastActivity: string;
+  }> {
+    try {
+      if (existsSync(TMUX_SESSION_FILE)) {
+        return JSON.parse(readFileSync(TMUX_SESSION_FILE, "utf-8"));
+      }
+    } catch {
+      // Ignore errors
+    }
+    return {};
+  }
+
+  /**
+   * Save session metadata to file.
+   */
+  private saveSessionMetadataRaw(metadata: Record<string, unknown>): void {
+    writeFileSync(TMUX_SESSION_FILE, JSON.stringify(metadata, null, 2));
+  }
+
+  // ==================== Status ====================
+
+  /**
+   * Get bridge status.
+   */
+  getStatus(): TmuxBridgeStatus {
+    const locks = this.loadLocks();
+    const currentLock = this.currentSession
+      ? locks[this.currentSession.sessionName]
+      : null;
+
+    return {
+      enabled: true,
+      session: this.currentSession,
+      isResponding: this.pollAbortController !== null,
+      lock: currentLock || null,
+      lastActivity: this.currentSession?.lastActivity || null,
+    };
+  }
+}

@@ -1,11 +1,172 @@
 # 项目进度
 
 ## 当前状态
-- **阶段**: SQLite 功能测试完成
-- **任务**: 等待 QA 审查
-- **状态**: ✅ 测试通过
+- **阶段**: Tmux Bridge 功能开发完成
+- **任务**: 实现 tmux 桥接，让 Telegram Bot 与 Claude CLI 共享终端
+- **状态**: ✅ 代码完成，E2E 测试通过
 
 ## 执行日志（按时间倒序）
+
+### 2026-01-26 - Tmux Bridge 功能开发完成
+**任务**: 实现 tmux 桥接功能
+**状态**: ✅ 代码实现完成
+**完成内容**:
+- [x] 创建 src/tmux/ 模块
+- [x] 实现 TmuxBridge 核心类 (bridge.ts, ~600行)
+- [x] 实现终端输出解析器 (parser.ts)
+- [x] 创建类型定义 (types.ts)
+- [x] 创建配置文件 (config.ts)
+- [x] 修改 session.ts 集成 TmuxBridge
+- [x] 修改 commands.ts 更新 /status 和 /sessions 命令
+- [x] 修改 callback.ts 添加 tmux: 回调处理
+- [x] 更新 .env.example 添加 tmux 配置
+- [x] TypeScript 类型检查通过
+- [ ] 实际功能测试
+
+**设计决策**:
+- 通过 `TMUX_BRIDGE_ENABLED=true` 环境变量启用
+- tmux session 后台运行，用户可 `tmux attach` 查看
+- 加锁机制防止并发输入冲突
+- Telegram 创建的 session: 10分钟空闲后自动关闭
+- 接管的 CLI session: 只释放控制权，CLI 继续运行
+- `/sessions` 命令在 tmux 模式下显示 tmux 会话列表
+
+**关键文件**:
+- `src/tmux/types.ts` - 类型定义 (TmuxSession, ParsedBlock, ParseState 等)
+- `src/tmux/config.ts` - 配置常量 (TMUX_ENABLED, POLL_INTERVAL 等)
+- `src/tmux/parser.ts` - 终端输出解析器 (状态机解析 Claude 输出)
+- `src/tmux/bridge.ts` - 核心桥接类 (会话管理、消息发送、输出捕获)
+- `src/tmux/index.ts` - 模块导出
+- `src/session.ts` - 集成 TmuxBridge (sendMessageViaTmux, getTmuxStatus 等)
+- `src/handlers/commands.ts` - 更新 /status, /sessions 命令
+- `src/handlers/callback.ts` - 添加 tmux: 回调处理
+- `.env.example` - 添加 tmux 配置说明
+
+**环境变量**:
+```bash
+TMUX_BRIDGE_ENABLED=false   # 启用 tmux 桥接
+TMUX_SESSION_PREFIX=claude-tg  # tmux 会话前缀
+TMUX_POLL_INTERVAL=100      # 轮询间隔 (ms)
+TMUX_MAX_POLL_TIME=180000   # 最大轮询时间 (ms)
+TMUX_IDLE_TIMEOUT=600000    # 空闲超时 (ms)
+```
+
+**测试结果** (2026-01-26):
+- ✅ tmux 安装成功 (v3.6a)
+- ✅ TmuxBridge 基础功能测试通过
+  - 会话创建/列出/删除
+  - 状态获取
+- ✅ 消息发送和响应解析测试通过
+  - 正确检测处理指示符 (✽)
+  - 正确检测响应指示符 (⏺)
+  - 正确提取响应文本
+  - 正确检测完成状态
+- ✅ TypeScript 类型检查通过
+
+**测试用例输出**:
+```
+=== TmuxBridge Message Test ===
+1. Creating tmux session with Claude...
+   Session: test-msg-xxx
+2. Waiting for Claude to initialize (3s)...
+3. Checking tmux pane content...
+   Claude ready: true
+4. Sending test message to Claude...
+   Claude is processing...
+   [thinking] (thinking...)
+   Claude is responding...
+   [text] hello
+   Response complete. Text: "hello"
+   [done] Response complete
+5. Final response: "hello"
+6. Cleaning up...
+   Session killed
+=== Test complete ===
+```
+
+**E2E 测试结果** (2026-01-26):
+```
+=== End-to-End Tmux Bridge Test ===
+
+1. Testing configuration...
+   TMUX_ENABLED: true
+   ✅ Configuration OK
+
+2. Testing TmuxBridge instantiation...
+   ✅ TmuxBridge created
+
+3. Testing session creation...
+   ✅ Session created
+
+4. Waiting for Claude to initialize (5s)...
+   ✅ Wait complete
+
+5. Testing message send and response...
+   Claude is processing...
+   [thinking] Processing...
+   Claude is responding...
+   [text] test
+   Response complete. Text: "test"
+   [done] Complete
+   ✅ Message flow OK
+
+6. Testing session listing...
+   ✅ Session listing OK
+
+7. Testing stop functionality...
+   ✅ Stop method callable
+
+8. Testing mark for exit...
+   ✅ Mark for exit OK
+
+9. Cleaning up test session...
+   ✅ Session cleaned up
+
+=== All E2E Tests Passed ===
+```
+
+**后续测试**（可选，Bot 集成测试需手动）:
+- [ ] Telegram Bot 集成测试 (需要启动 Bot + Telegram 客户端)
+- [ ] /sessions 命令接管 CLI 会话测试
+- [ ] /stop 发送 Ctrl+C 测试
+- [ ] /new 清理 session 测试
+
+---
+
+### 2026-01-25 23:30 - 多 Bot 并行执行系统设计（调研）
+**任务**: 设计多 Bot 并行任务执行架构
+**状态**: ✅ 完成（仅设计，暂不实现）
+**完成内容**:
+- [x] 分析当前单 Bot 架构限制
+- [x] 设计 Master Bot + Worker Bots 架构
+- [x] 规划动态扩缩容机制
+- [x] 设计多 Telegram 对话交互模式
+- [x] 创建设计文档 `docs/multi-bot-parallel-design.md`
+
+**设计要点**:
+- Master Bot 负责接收任务、管理队列、分配 Worker
+- 每个 Worker Bot 是独立的 Telegram Bot，有独立身份
+- 用户可在多个 Telegram 对话框中同时查看不同 Worker 的处理过程
+- 支持动态扩缩容：MIN=1, MAX=5 Workers
+- 数据库扩展：workers 表 + tasks 表
+
+**文档位置**: `docs/multi-bot-parallel-design.md`
+
+**备注**: 此功能为未来演进方向，当前不实现，仅作为技术调研和设计储备。
+
+---
+
+### 2026-01-25 23:00 - 代码提交到 GitHub
+**任务**: 将 SQLite 多设备同步功能提交到 GitHub
+**状态**: ✅ 完成
+**完成内容**:
+- [x] QA 审查通过（评分 4.5/5）
+- [x] Git commit: `2627474 feat: add SQLite multi-device session synchronization`
+- [x] 推送到 GitHub
+
+**提交统计**: 9 files changed, 848 insertions(+)
+
+---
 
 ### 2026-01-25 22:50 - SQLite 外键错误修复及测试验证
 **任务**: 修复外键约束错误，验证 Bot 功能

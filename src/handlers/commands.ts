@@ -6,7 +6,7 @@
 
 import type { Context } from "grammy";
 import { session } from "../session";
-import { WORKING_DIR, ALLOWED_USERS, RESTART_FILE } from "../config";
+import { WORKING_DIR, ALLOWED_USERS, RESTART_FILE, TMUX_ENABLED } from "../config";
 import { isAuthorized } from "../security";
 
 /**
@@ -151,12 +151,27 @@ export async function handleStatus(ctx: Context): Promise<void> {
   const uptimeStr = formatUptime(uptime);
   lines.push(`⏱️ Uptime: ${uptimeStr}`);
 
-  // Session status
-  if (session.isActive) {
-    lines.push(`\n✅ <b>Session</b>: Active`);
-    lines.push(`   ID: <code>${session.sessionId?.slice(0, 16)}...</code>`);
-  } else {
-    lines.push("\n⚪ <b>Session</b>: None");
+  // Tmux mode status
+  const tmuxStatus = session.getTmuxStatus();
+  if (tmuxStatus.enabled) {
+    lines.push(`\n🖥️ <b>Tmux Mode</b>: Enabled`);
+    if (tmuxStatus.session) {
+      lines.push(`   Session: <code>${tmuxStatus.session.sessionName}</code>`);
+      lines.push(`   Created by: ${tmuxStatus.session.createdBy}`);
+      lines.push(`   Responding: ${tmuxStatus.isResponding ? "Yes" : "No"}`);
+    } else {
+      lines.push(`   Session: None (will create on next message)`);
+    }
+  }
+
+  // Session status (Agent SDK mode)
+  if (!tmuxStatus.enabled) {
+    if (session.isActive) {
+      lines.push(`\n✅ <b>Session</b>: Active`);
+      lines.push(`   ID: <code>${session.sessionId?.slice(0, 16)}...</code>`);
+    } else {
+      lines.push("\n⚪ <b>Session</b>: None");
+    }
   }
 
   // Query status
@@ -353,7 +368,9 @@ export async function handleRestart(ctx: Context): Promise<void> {
 }
 
 /**
- * /sessions - List Claude Code sessions to take over.
+ * /sessions - List sessions to take over.
+ * In tmux mode: lists running tmux sessions
+ * In Agent SDK mode: lists Claude Code sessions from ~/.claude/
  */
 export async function handleSessions(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
@@ -363,7 +380,53 @@ export async function handleSessions(ctx: Context): Promise<void> {
     return;
   }
 
-  // Get Claude Code sessions
+  // In tmux mode, list tmux sessions
+  if (TMUX_ENABLED) {
+    const tmuxSessions = await session.listTmuxSessions();
+
+    if (tmuxSessions.length === 0) {
+      await ctx.reply(
+        "❌ 没有找到 tmux 会话。\n\n" +
+          "提示：在终端运行 <code>claude</code> 启动一个会话，然后回来接管。",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    // Build inline keyboard with tmux session list
+    const buttons = tmuxSessions.map((s) => {
+      const lastActive = s.lastActivity
+        ? new Date(s.lastActivity).toLocaleTimeString("zh-CN", {
+            hour: "2-digit",
+            minute: "2-digit",
+          })
+        : "?";
+      const creator = s.createdBy === "telegram" ? "🤖" : "💻";
+      const owned = s.isOwned ? "🔒" : "";
+
+      return [
+        {
+          text: `${creator} ${s.sessionName} ${owned} (${lastActive})`,
+          callback_data: `tmux:${s.sessionName}`,
+        },
+      ];
+    });
+
+    await ctx.reply(
+      "🖥️ <b>Tmux 会话列表</b>\n\n" +
+        "💻 = CLI 创建  🤖 = Telegram 创建  🔒 = 已被接管\n\n" +
+        "选择一个会话来接管：",
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: buttons,
+        },
+      }
+    );
+    return;
+  }
+
+  // Agent SDK mode: Get Claude Code sessions
   const sessions = session.getClaudeCodeSessions();
 
   if (sessions.length === 0) {

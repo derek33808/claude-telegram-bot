@@ -236,6 +236,16 @@ if (ALLOWED_USERS.length === 0) {
   process.exit(1);
 }
 
+// ============== Tmux Bridge Configuration ==============
+
+// Re-export tmux config for convenience
+export {
+  TMUX_ENABLED,
+  TMUX_SESSION_PREFIX,
+  TMUX_POLL_INTERVAL,
+  TMUX_IDLE_TIMEOUT,
+} from "./tmux/config";
+
 console.log(
   `Config loaded: ${ALLOWED_USERS.length} allowed users, working dir: ${WORKING_DIR}`
 );

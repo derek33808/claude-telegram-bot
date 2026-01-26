@@ -128,3 +128,136 @@ git merge upstream/main
 - **claude-monitor** - Web 监控工具 (已暂停)
   - 定位：被动监控 + 远程确认
   - 互补：claude-telegram-bot 用于主动发任务
+
+---
+
+# Tmux Bridge 功能设计
+
+## 功能目标
+
+让 Telegram Bot 通过 tmux 与 Claude Code CLI 交互，实现：
+1. **新建模式**：启动持久的 Claude Code 进程（保持内存和 KV cache）
+2. **接管模式**：真正共享 CLI 终端的实时交互
+
+## 架构设计
+
+```
+┌─────────────────────────────────────┐
+│     Claude Code (tmux 中持久运行)    │
+│     - 内存状态保持                   │
+│     - KV cache 连续命中              │
+└──────────┬─────────────┬────────────┘
+           │             │
+    tmux send-keys   tmux capture-pane
+           │             │
+      ┌────▼─────────────▼────┐
+      │     TmuxBridge        │
+      │  - 发送消息            │
+      │  - 捕获输出            │
+      │  - 解析事件            │
+      └───────────┬───────────┘
+                  │
+           statusCallback
+                  │
+      ┌───────────▼───────────┐
+      │   Telegram Handler    │
+      └───────────────────────┘
+```
+
+## 设计决策
+
+### 1. 触发方式
+
+通过环境变量配置，启用后所有消息自动使用 tmux 模式：
+
+```bash
+TMUX_BRIDGE_ENABLED=true
+```
+
+### 2. tmux session 运行方式
+
+- 后台运行（detached），不弹出 Terminal.app 窗口
+- 用户可随时 `tmux attach -t <session>` 连接查看
+- Claude Code CLI 在 tmux session 中持久运行
+
+### 3. 并发控制 - 加锁机制
+
+- Telegram 发消息时获取锁，响应完成后释放
+- CLI 用户可以看到所有交互，但需等待锁释放后才能输入
+- 防止混合输入导致的问题
+
+### 4. 会话生命周期
+
+| 创建方式 | 退出条件 | 行为 |
+|---------|---------|------|
+| Telegram 创建 | /new、/stop、切换 session | 标记可退出，10分钟后 tmux 自动关闭 |
+| 接管 CLI | Telegram 退出或切换 | 只释放接管权，CLI 继续运行 |
+
+### 5. 命令变化（tmux 模式下）
+
+| 命令 | 行为 |
+|------|------|
+| `/new` | 结束当前 session，下次消息创建新的 |
+| `/stop` | 发送 Ctrl+C 中断响应，session 保持 |
+| `/sessions` | 列出运行中的 tmux sessions，选择接管 |
+| `/tmux` | 显示当前 tmux session 状态（调试用） |
+
+**移除的命令**：
+- `/resume` - 功能合并到 `/sessions`
+
+## 技术实现
+
+### 新增文件
+
+| 文件 | 职责 |
+|------|------|
+| `src/tmux/types.ts` | 类型定义 |
+| `src/tmux/config.ts` | 配置常量 |
+| `src/tmux/parser.ts` | 终端输出解析器 |
+| `src/tmux/bridge.ts` | TmuxBridge 核心类 |
+| `src/tmux/index.ts` | 模块导出 |
+
+### 修改文件
+
+| 文件 | 修改内容 |
+|------|---------|
+| `src/session.ts` | 添加 tmux 桥接分支 |
+| `src/handlers/commands.ts` | 修改命令行为，移除 /resume |
+| `src/config.ts` | 添加 tmux 环境变量 |
+| `src/index.ts` | 移除 /resume 命令注册 |
+| `.env.example` | 添加 tmux 配置示例 |
+
+### 配置项
+
+```bash
+# Tmux Bridge
+TMUX_BRIDGE_ENABLED=false      # 启用 tmux 桥接
+TMUX_SESSION_PREFIX=claude-tg  # session 名称前缀
+TMUX_POLL_INTERVAL=100         # 输出轮询间隔 (ms)
+```
+
+## 验收标准
+
+### 基础功能测试
+
+1. 设置 `TMUX_BRIDGE_ENABLED=true`
+2. 发送消息，确认创建了 tmux 会话
+3. `tmux attach` 确认能看到交互
+4. Telegram 发送更多消息，确认两边都更新
+
+### 接管测试
+
+5. 在 tmux 中启动 `claude`
+6. 使用 `/sessions` 接管该会话
+7. 确认 Telegram 能继续交互
+8. `/new` 后确认 CLI 继续运行
+
+### 生命周期测试
+
+9. Telegram 创建 session 后 `/new`
+10. 等待 10 分钟，确认 tmux 自动关闭
+
+## 依赖
+
+- **tmux**：需要系统安装（macOS: `brew install tmux`）
+- 无需新增 npm 包
