@@ -103,6 +103,9 @@ class ClaudeSession {
   private tmuxBridge: TmuxBridge | null = null;
   private tmuxSession: TmuxSession | null = null;
 
+  // CLI watcher notification callback (set by bot to forward to Telegram)
+  private cliActivityCallback: ((content: string) => void) | null = null;
+
   // Current user context
   private currentUserId: number | null = null;
   private currentUsername: string | null = null;
@@ -168,6 +171,23 @@ class ClaudeSession {
     return bridge.listSessions();
   }
 
+  /**
+   * Set callback for CLI activity notifications.
+   * When Claude responds to CLI-typed input, this callback is invoked.
+   */
+  setCliActivityCallback(callback: (content: string) => void): void {
+    this.cliActivityCallback = callback;
+  }
+
+  /**
+   * Start CLI watcher on current tmux bridge (if available).
+   */
+  private startCliWatcherIfNeeded(): void {
+    if (!this.tmuxBridge || !this.cliActivityCallback) return;
+    if (this.tmuxBridge.isCliWatcherRunning()) return;
+    this.tmuxBridge.startCliWatcher(this.cliActivityCallback);
+  }
+
   async getTmuxSessionSummary(sessionName: string): Promise<string> {
     if (!TMUX_ENABLED) return "";
     const bridge = this.getTmuxBridge();
@@ -184,6 +204,7 @@ class ClaudeSession {
     try {
       const bridge = this.getTmuxBridge();
       this.tmuxSession = await bridge.attachToSession(sessionName);
+      this.startCliWatcherIfNeeded();
       return [true, `Attached to session: ${sessionName}`];
     } catch (error) {
       return [false, `Failed to attach: ${error}`];
@@ -334,6 +355,7 @@ class ClaudeSession {
       );
 
       console.log(`Tmux session created: ${this.tmuxSession.sessionName}`);
+      this.startCliWatcherIfNeeded();
     }
 
     // Update processing state
@@ -746,6 +768,7 @@ class ClaudeSession {
   async kill(): Promise<void> {
     // In tmux mode, mark session for exit (triggers cleanup based on creation type)
     if (TMUX_ENABLED && this.tmuxBridge) {
+      this.tmuxBridge.stopCliWatcher();
       this.tmuxBridge.markForExit();
       this.tmuxSession = null;
       console.log("Tmux session marked for exit");

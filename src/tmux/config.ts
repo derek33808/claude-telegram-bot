@@ -79,6 +79,13 @@ export const TMUX_HISTORY_LIMIT = parseInt(
 );
 
 /**
+ * Whether to watch for CLI-side activity and forward to Telegram.
+ * Set TMUX_CLI_WATCH=true to enable.
+ */
+export const TMUX_CLI_WATCH =
+  (process.env.TMUX_CLI_WATCH || "true").toLowerCase() === "true";
+
+/**
  * Get default tmux bridge configuration.
  *
  * @param workingDir - Working directory for Claude Code

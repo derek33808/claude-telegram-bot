@@ -1,11 +1,35 @@
 # 项目进度
 
 ## 当前状态
-- **阶段**: 自动生命周期功能开发完成
-- **任务**: /sessions 摘要优化 + 自动启动/退出功能
-- **状态**: ✅ 开发完成，typecheck 通过
+- **阶段**: Tmux Bridge 双向同步修复完成
+- **任务**: 修复响应回传丢信息 + CLI端操作不可见问题
+- **状态**: ✅ 开发完成，QA审查通过，已部署
 
 ## 执行日志（按时间倒序）
+
+### 2026-01-28 12:05 - Tmux Bridge 双向同步修复
+**任务**: 修复 pollForResponse 丢失响应 + CLI端活动不转发到Telegram
+**状态**: ✅ 完成
+
+**修复内容**:
+| Fix | 问题 | 方案 |
+|-----|------|------|
+| Fix 1 | sentMessage滚出scrollback导致响应丢失 | lastSlicedContent尾部重叠比对备用锚点 |
+| Fix 2 | parser processedLength在内容位移时失效 | 检测位移并重算processedLength |
+| Fix 3 | CLI端直接输入时Telegram看不到 | CLI活动监听器，2秒轮询检测新响应 |
+
+**修改文件**:
+- `src/tmux/bridge.ts` - 稳定pollForResponse追踪 + CLI watcher + attachToSession设history-limit
+- `src/tmux/parser.ts` - 内容位移检测 + resetProcessedLength方法
+- `src/tmux/config.ts` - 新增 TMUX_CLI_WATCH 配置项
+- `src/session.ts` - 集成CLI watcher（创建/接管时启动，kill时停止）
+
+**QA审查结果**: 通过（评分3.5/5），P1问题已修复：
+- parser用lastIndexOf替换indexOf防止误匹配
+- baseline capture添加.catch()防止首次误报
+- watcher添加防重入guard
+
+---
 
 ### 2026-01-28 11:35 - 自动生命周期管理功能
 **任务**: 设计并开发 bot 自动启动/退出功能

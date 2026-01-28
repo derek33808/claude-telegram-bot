@@ -154,9 +154,34 @@ export class TerminalOutputParser {
     // Clean the output
     const cleaned = cleanOutput(rawOutput);
 
+    // Detect content displacement (content shifted rather than grew)
+    // This happens when the tmux scrollback anchor scrolls out
+    if (cleaned.length <= this.processedLength && this.buffer) {
+      // Check if the content actually changed (displacement) vs just no new content
+      const bufferTail = this.buffer.slice(-200);
+      const cleanedTail = cleaned.slice(-200);
+      if (bufferTail !== cleanedTail && cleaned.length > 0) {
+        // Content displaced - find overlap and adjust processedLength
+        const overlapLen = Math.min(this.buffer.length, cleaned.length, 500);
+        const oldTail = this.buffer.slice(-overlapLen);
+        const idx = cleaned.lastIndexOf(oldTail);
+        if (idx >= 0) {
+          // Found overlap - only process content after the overlap
+          this.processedLength = idx + overlapLen;
+        } else {
+          // No overlap found - reset and reprocess
+          console.warn("Parser: content displacement with no overlap, resetting processedLength");
+          this.processedLength = 0;
+        }
+      } else {
+        // No change - just check completion
+        this.checkCompletion(cleaned);
+        return [];
+      }
+    }
+
     // Only process new content
     if (cleaned.length <= this.processedLength) {
-      // Check for completion even if no new content
       this.checkCompletion(cleaned);
       return [];
     }
@@ -460,6 +485,15 @@ export class TerminalOutputParser {
    */
   getState(): ParseState {
     return this.state;
+  }
+
+  /**
+   * Reset only the processedLength (used when content anchor is lost).
+   * Preserves accumulated text and state so we don't lose parsed responses.
+   */
+  resetProcessedLength(): void {
+    this.processedLength = 0;
+    this.buffer = "";
   }
 
   /**

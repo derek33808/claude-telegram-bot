@@ -20,6 +20,7 @@ import {
   TMUX_SESSION_FILE,
   TMUX_LOCK_TIMEOUT,
   TMUX_IDLE_TIMEOUT,
+  TMUX_CLI_WATCH,
 } from "./config";
 import { TerminalOutputParser } from "./parser";
 
@@ -31,6 +32,11 @@ export class TmuxBridge {
   private currentSession: TmuxSession | null = null;
   private pollAbortController: AbortController | null = null;
   private cleanupTimers: Map<string, NodeJS.Timeout> = new Map();
+
+  // CLI watcher state
+  private cliWatcherTimer: NodeJS.Timeout | null = null;
+  private lastKnownPaneContent: string = "";
+  private cliWatcherCallback: ((content: string) => void) | null = null;
 
   constructor(config: Partial<TmuxBridgeConfig> & { workingDir: string }) {
     this.config = {
@@ -139,6 +145,17 @@ export class TmuxBridge {
     target.isOwned = true;
     target.lastActivity = new Date();
     this.currentSession = target;
+
+    // Set history-limit for taken-over sessions too
+    try {
+      await this.executeTmux([
+        "set-option",
+        "-t", sessionName,
+        "history-limit", String(this.config.historyLimit),
+      ]);
+    } catch {
+      console.warn(`Failed to set history-limit on ${sessionName}`);
+    }
 
     // Save metadata
     this.saveSessionMetadata();
@@ -470,6 +487,10 @@ export class TmuxBridge {
     let sawProcessing = false;
     let sawResponse = false;
 
+    // Stable content tracking: remember the last successful slice anchor
+    let lastSliceAnchor: string | null = sentMessage || null;
+    let lastSlicedContent: string = "";
+
     this.pollAbortController = new AbortController();
 
     try {
@@ -493,10 +514,34 @@ export class TmuxBridge {
 
           // Extract content AFTER the sent message to only look at the response
           let newContent = paneContent;
-          if (sentMessage) {
-            const msgIndex = paneContent.lastIndexOf(sentMessage);
+          if (lastSliceAnchor) {
+            const msgIndex = paneContent.lastIndexOf(lastSliceAnchor);
             if (msgIndex >= 0) {
-              newContent = paneContent.slice(msgIndex + sentMessage.length);
+              newContent = paneContent.slice(msgIndex + lastSliceAnchor.length);
+              lastSlicedContent = newContent;
+            } else {
+              // Anchor scrolled out of scrollback - use diff-based fallback
+              // Find how much of the previous sliced content is still at the end of pane
+              if (lastSlicedContent) {
+                // Look for overlap: find the tail of lastSlicedContent in new paneContent
+                const tailLen = Math.min(lastSlicedContent.length, 500);
+                const tail = lastSlicedContent.slice(-tailLen);
+                const tailIdx = paneContent.lastIndexOf(tail);
+                if (tailIdx >= 0) {
+                  // Content after the known tail is the truly new content
+                  newContent = paneContent.slice(tailIdx);
+                  lastSlicedContent = newContent;
+                } else {
+                  // Complete discontinuity - reset parser and use full pane
+                  console.warn("Content anchor lost and no overlap found, resetting parser");
+                  parser.resetProcessedLength();
+                  newContent = paneContent;
+                  lastSlicedContent = newContent;
+                }
+              } else {
+                newContent = paneContent;
+                lastSlicedContent = newContent;
+              }
             }
           }
 
@@ -528,6 +573,8 @@ export class TmuxBridge {
             if (sawResponse && parser.isComplete()) {
               const response = parser.getTextResponse();
               console.log(`Response complete. Text: "${response.slice(0, 100)}"`);
+              // Update watcher baseline
+              this.lastKnownPaneContent = paneContent;
               await statusCallback("done", "");
               return response;
             }
@@ -675,6 +722,111 @@ export class TmuxBridge {
   }
 
   // ==================== Status ====================
+
+  // ==================== CLI Activity Watcher ====================
+
+  /**
+   * Start watching for CLI-side activity (commands typed directly in tmux).
+   * When new ⏺ responses are detected that weren't triggered by sendMessage(),
+   * the callback is invoked with the new content.
+   *
+   * @param callback - Called with new response content from CLI activity
+   */
+  startCliWatcher(callback: (content: string) => void): void {
+    if (!TMUX_CLI_WATCH) {
+      console.log("CLI watcher disabled (TMUX_CLI_WATCH=false)");
+      return;
+    }
+    if (this.cliWatcherTimer) {
+      console.log("CLI watcher already running");
+      return;
+    }
+
+    this.cliWatcherCallback = callback;
+    console.log("Starting CLI activity watcher...");
+
+    // Capture initial baseline
+    this.capturePane().then((content) => {
+      this.lastKnownPaneContent = content;
+    }).catch(() => {
+      console.warn("CLI watcher: failed to capture initial baseline");
+    });
+
+    let watcherRunning = false;
+    this.cliWatcherTimer = setInterval(async () => {
+      // Don't watch while we're actively polling for a response
+      if (this.pollAbortController) return;
+      if (!this.currentSession) return;
+      // Re-entrancy guard
+      if (watcherRunning) return;
+      watcherRunning = true;
+
+      try {
+        const paneContent = await this.capturePane();
+        if (paneContent === this.lastKnownPaneContent) return;
+
+        const oldContent = this.lastKnownPaneContent;
+        this.lastKnownPaneContent = paneContent;
+
+        // Detect new ⏺ responses that appeared since last check
+        // Find content that's new (not in old content)
+        const oldLines = new Set(oldContent.split("\n").map(l => l.trim()).filter(Boolean));
+        const newLines = paneContent.split("\n");
+        const newResponseLines: string[] = [];
+        let inNewResponse = false;
+
+        for (const line of newLines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+
+          // Skip lines we already knew about
+          if (oldLines.has(trimmed) && !inNewResponse) continue;
+
+          // Detect new response block
+          if (/^⏺\s+/.test(line)) {
+            inNewResponse = true;
+            newResponseLines.push(trimmed);
+          } else if (inNewResponse) {
+            // Check if this is a new prompt (end of response)
+            if (/^❯/.test(line)) {
+              inNewResponse = false;
+            } else {
+              newResponseLines.push(trimmed);
+            }
+          }
+        }
+
+        if (newResponseLines.length > 0 && this.cliWatcherCallback) {
+          const newContent = newResponseLines.join("\n");
+          console.log(`CLI watcher detected new activity: ${newContent.slice(0, 80)}...`);
+          this.cliWatcherCallback(newContent);
+        }
+      } catch {
+        // Ignore errors in watcher (session might have been killed)
+      } finally {
+        watcherRunning = false;
+      }
+    }, 2000); // Check every 2 seconds
+  }
+
+  /**
+   * Stop the CLI activity watcher.
+   */
+  stopCliWatcher(): void {
+    if (this.cliWatcherTimer) {
+      clearInterval(this.cliWatcherTimer);
+      this.cliWatcherTimer = null;
+      this.cliWatcherCallback = null;
+      console.log("CLI watcher stopped");
+    }
+  }
+
+  /**
+   * Check if CLI watcher is running.
+   */
+  isCliWatcherRunning(): boolean {
+    return this.cliWatcherTimer !== null;
+  }
 
   /**
    * Get bridge status.
