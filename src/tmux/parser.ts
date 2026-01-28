@@ -17,8 +17,11 @@ import { ParseState, type ParsedBlock } from "./types";
  * - Prompt ready: "❯ " (empty, at bottom between horizontal lines)
  */
 export const PATTERNS = {
-  /** Input prompt: "❯" followed by optional text, or traditional ">" */
+  /** Input prompt: "❯" alone or with placeholder suggestion text */
   PROMPT: /^❯\s*$/m,
+
+  /** Input prompt (relaxed): "❯" followed by anything (includes placeholder suggestions) */
+  PROMPT_RELAXED: /^❯/m,
 
   /** User input line: "❯ " followed by text */
   USER_INPUT: /^❯\s+.+/m,
@@ -37,6 +40,15 @@ export const PATTERNS = {
 
   /** Tool use start - common tool emojis and names */
   TOOL_START: /^[🔧📁📝💻🔍🌐⚡]\s*\w+/m,
+
+  /** Claude Code tool patterns - ● Read, ● Write, ● Bash, etc. */
+  CLAUDE_TOOL: /^[●○◉◐]\s*(Read|Write|Edit|Bash|Glob|Grep|WebFetch|WebSearch|Task|TodoWrite|NotebookEdit|AskUserQuestion)/m,
+
+  /** Tool output lines (indented with └ or │ or spaces) */
+  TOOL_OUTPUT: /^[\s│└├─┬┴┼]+/,
+
+  /** Collapsed content indicator */
+  COLLAPSED: /^…\s*\+?\d+\s*lines?/,
 
   /** Tool execution indicator */
   TOOL_RUNNING: /^(Running|Executing|Reading|Writing|Searching)/m,
@@ -60,7 +72,28 @@ export const PATTERNS = {
   USAGE: /^(Usage:|Tokens:|Cost:)/m,
 
   /** Horizontal line separator (Claude Code TUI) */
-  SEPARATOR: /^─{10,}/m,
+  SEPARATOR: /^[─━═]{5,}/m,
+
+  /** Table border lines (horizontal separators with joints) */
+  TABLE_BORDER: /^[│├┤┬┴┼┌┐└┘─━═\s]+$/,
+
+  /** Pure UI chrome to filter out (ASCII art, borders, etc.) */
+  UI_CHROME: /^(▐|▝|▜|▛|▘|█|░|▒|▓|·\s|✢)/,
+
+  /** Box drawing characters for stripping from table cells */
+  BOX_CHARS: /[│├┤┬┴┼┌┐└┘─━═]/g,
+
+  /** Permission/confirmation prompts */
+  PERMISSION_PROMPT: /^(Do you want to|Allow|Approve|Confirm|Accept|Would you like to)/i,
+
+  /** Edit file indicator */
+  EDIT_FILE: /^Edit\s+(file\s+)?[\w\/\.\-]+/,
+
+  /** Diff line (added/removed) */
+  DIFF_LINE: /^\d+\s*[+\-]/,
+
+  /** Menu options (1. Yes, 2. No, etc.) */
+  MENU_OPTION: /^\s*[>\s]*\d+\.\s+/,
 };
 
 /**
@@ -144,6 +177,11 @@ export class TerminalOutputParser {
   /**
    * Parse content and emit blocks.
    * Handles Claude Code TUI format with ❯ for input and ⏺ for response.
+   *
+   * Modified to preserve more information for Telegram display:
+   * - Tool usage (Read, Write, Bash, etc.)
+   * - Thinking/processing status
+   * - Only filters pure UI chrome (ASCII art borders)
    */
   private parseContent(content: string): ParsedBlock[] {
     const blocks: ParsedBlock[] = [];
@@ -152,27 +190,98 @@ export class TerminalOutputParser {
     for (const line of lines) {
       const trimmedLine = line.trim();
 
-      // Skip empty lines, horizontal separators, and TUI chrome
+      // Skip empty lines and horizontal separators
       if (!trimmedLine || PATTERNS.SEPARATOR.test(line)) {
         continue;
       }
 
-      // Skip UI elements like "? for shortcuts", version info, etc.
+      // Skip pure table border lines (only box drawing chars)
+      if (PATTERNS.TABLE_BORDER.test(trimmedLine)) {
+        continue;
+      }
+
+      // Skip only pure UI chrome (ASCII art borders, decorations)
+      if (PATTERNS.UI_CHROME.test(trimmedLine)) {
+        continue;
+      }
+
+      // Clean box drawing characters from table cells, convert to plain text
+      // e.g., "│ 类型 │ 数量 │" -> "类型 | 数量"
+      let cleanedLine = trimmedLine;
+      if (PATTERNS.BOX_CHARS.test(trimmedLine)) {
+        cleanedLine = trimmedLine
+          .replace(PATTERNS.BOX_CHARS, "|")
+          .replace(/\|{2,}/g, "|")
+          .replace(/^\||\|$/g, "")
+          .trim();
+        // Skip if line becomes empty after cleaning
+        if (!cleanedLine) continue;
+      }
+
+      // Skip repetitive status bar elements (but keep meaningful status)
       if (trimmedLine.includes("for shortcuts") ||
-          trimmedLine.includes("Claude Code v") ||
-          trimmedLine.includes("Opus") ||
-          trimmedLine.startsWith("▐") ||
-          trimmedLine.startsWith("▝") ||
-          trimmedLine.startsWith("▘") ||
-          trimmedLine.includes("Auto-update") ||
-          trimmedLine.includes("Chrome enabled") ||
-          trimmedLine.includes("claude doctor") ||
+          trimmedLine.includes("shift+tab to cycle") ||
           trimmedLine.includes("esc to interrupt") ||
-          trimmedLine.startsWith("·") ||
-          trimmedLine.startsWith("✢") ||
-          trimmedLine.includes("Stewing") ||
-          trimmedLine.includes("Fiddle-faddling") ||
-          trimmedLine.includes("thinking)")) {
+          trimmedLine.includes("Auto-update failed") ||
+          trimmedLine.includes("claude doctor") ||
+          trimmedLine.includes("npm i -g")) {
+        continue;
+      }
+
+      // Check for Claude Code tool usage (● Read, ● Write, ● Bash, etc.)
+      if (PATTERNS.CLAUDE_TOOL.test(line)) {
+        // Emit any accumulated content first
+        if (this.currentBlockContent) {
+          blocks.push({ type: "text", content: this.currentBlockContent.trim() });
+          this.currentBlockContent = "";
+        }
+        this.state = ParseState.TOOL_USE;
+        // Replace ● with 🔧 for better visibility
+        const toolLine = trimmedLine.replace(/^[●○◉◐]\s*/, "🔧 ");
+        blocks.push({ type: "tool", content: toolLine });
+        continue;
+      }
+
+      // Check for tool output lines (indented with └ │ etc.)
+      if (this.state === ParseState.TOOL_USE && PATTERNS.TOOL_OUTPUT.test(line)) {
+        // Capture tool output, clean up box-drawing characters
+        const cleanedOutput = trimmedLine.replace(/^[└│├─┬┴┼]+\s*/, "  ");
+        if (cleanedOutput.trim() && !PATTERNS.COLLAPSED.test(cleanedOutput)) {
+          blocks.push({ type: "tool", content: cleanedOutput });
+        }
+        continue;
+      }
+
+      // Check for collapsed content (… +40 lines)
+      if (PATTERNS.COLLAPSED.test(line)) {
+        blocks.push({ type: "tool", content: `📄 ${trimmedLine}` });
+        continue;
+      }
+
+      // Check for Edit file indicator
+      if (PATTERNS.EDIT_FILE.test(trimmedLine)) {
+        this.state = ParseState.TOOL_USE;
+        blocks.push({ type: "tool", content: `📝 ${trimmedLine}` });
+        continue;
+      }
+
+      // Check for diff lines (code changes)
+      if (PATTERNS.DIFF_LINE.test(trimmedLine)) {
+        // Keep diff lines as tool output
+        blocks.push({ type: "tool", content: cleanedLine });
+        continue;
+      }
+
+      // Check for permission/confirmation prompts
+      if (PATTERNS.PERMISSION_PROMPT.test(trimmedLine)) {
+        this.state = ParseState.WAITING_INPUT;
+        blocks.push({ type: "text", content: `⚠️ ${trimmedLine}` });
+        continue;
+      }
+
+      // Check for menu options (1. Yes, 2. No, etc.)
+      if (PATTERNS.MENU_OPTION.test(line)) {
+        blocks.push({ type: "text", content: cleanedLine });
         continue;
       }
 
@@ -207,6 +316,8 @@ export class TerminalOutputParser {
         if (this.currentBlockContent) {
           if (this.state === ParseState.THINKING) {
             blocks.push({ type: "thinking", content: this.currentBlockContent.trim() });
+          } else if (this.currentBlockContent.trim()) {
+            blocks.push({ type: "text", content: this.currentBlockContent.trim() });
           }
           this.currentBlockContent = "";
         }
@@ -216,7 +327,7 @@ export class TerminalOutputParser {
         continue;
       }
 
-      // Check for tool start
+      // Check for tool start (emoji-based)
       if (PATTERNS.TOOL_START.test(line) || PATTERNS.TOOL_RUNNING.test(line)) {
         // Emit any accumulated content
         if (this.currentBlockContent && this.state === ParseState.THINKING) {
@@ -232,6 +343,7 @@ export class TerminalOutputParser {
 
       // Check for tool end
       if (this.state === ParseState.TOOL_USE && PATTERNS.TOOL_END.test(line)) {
+        blocks.push({ type: "tool", content: trimmedLine });
         if (PATTERNS.ERROR.test(line)) {
           blocks.push({ type: "error", content: trimmedLine });
         }
@@ -245,23 +357,26 @@ export class TerminalOutputParser {
         continue;
       }
 
-      // Accumulate content based on state
+      // Accumulate content based on state (use cleanedLine for display)
       switch (this.state) {
         case ParseState.THINKING:
-          this.currentBlockContent += (this.currentBlockContent ? "\n" : "") + line;
+          this.currentBlockContent += (this.currentBlockContent ? "\n" : "") + cleanedLine;
           break;
 
         case ParseState.TOOL_USE:
-          // Tool output, might want to capture it
+          // Capture tool output too (file content, command output, etc.)
+          if (cleanedLine && !PATTERNS.USAGE.test(line)) {
+            blocks.push({ type: "tool", content: cleanedLine });
+          }
           break;
 
         case ParseState.TEXT_OUTPUT:
         case ParseState.IDLE:
         default:
-          // Regular text output
-          if (trimmedLine && !PATTERNS.USAGE.test(line)) {
-            this.currentBlockContent += (this.currentBlockContent ? "\n" : "") + line;
-            this.textAccumulator += (this.textAccumulator ? "\n" : "") + line;
+          // Regular text output (use cleanedLine which has box chars converted)
+          if (cleanedLine && !PATTERNS.USAGE.test(line)) {
+            this.currentBlockContent += (this.currentBlockContent ? "\n" : "") + cleanedLine;
+            this.textAccumulator += (this.textAccumulator ? "\n" : "") + cleanedLine;
           }
           this.state = ParseState.TEXT_OUTPUT;
           break;
@@ -280,10 +395,27 @@ export class TerminalOutputParser {
   private checkCompletion(buffer: string): void {
     // Get last few lines
     const lines = buffer.split("\n").filter((l) => l.trim());
-    const lastLines = lines.slice(-3).join("\n");
+    const lastLines = lines.slice(-5).join("\n");
 
+    // First try strict prompt (empty ❯)
     if (PATTERNS.PROMPT.test(lastLines)) {
       if (this.state !== ParseState.COMPLETE) {
+        this.state = ParseState.COMPLETE;
+        this.promptDetectedAt = Date.now();
+      }
+      return;
+    }
+
+    // Relaxed check: after we've seen a response (⏺), any ❯ at the end
+    // indicates completion. Claude Code v2.1+ shows placeholder suggestions
+    // like "❯ help me start a new project" which won't match the strict pattern.
+    if (this.state === ParseState.TEXT_OUTPUT || this.state === ParseState.TOOL_USE) {
+      // Check if the last non-empty lines contain a separator (─) followed by ❯
+      // This is the Claude Code TUI pattern: response → separator → prompt
+      const lastFew = lines.slice(-4);
+      const hasSeparator = lastFew.some((l) => PATTERNS.SEPARATOR.test(l));
+      const hasPrompt = lastFew.some((l) => PATTERNS.PROMPT_RELAXED.test(l));
+      if (hasSeparator && hasPrompt) {
         this.state = ParseState.COMPLETE;
         this.promptDetectedAt = Date.now();
       }

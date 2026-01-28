@@ -168,6 +168,12 @@ class ClaudeSession {
     return bridge.listSessions();
   }
 
+  async getTmuxSessionSummary(sessionName: string): Promise<string> {
+    if (!TMUX_ENABLED) return "";
+    const bridge = this.getTmuxBridge();
+    return bridge.getSessionSummary(sessionName);
+  }
+
   /**
    * Attach to an existing tmux session (takeover mode).
    */
@@ -349,6 +355,14 @@ class ClaudeSession {
 
         // Use tmux session name as a pseudo session ID for tracking
         const tmuxSessionId = `tmux-${this.tmuxSession.sessionName}`;
+
+        // Ensure session record exists before saving messages (fixes foreign key constraint)
+        store.createSession(
+          tmuxSessionId,
+          this.currentUserId,
+          WORKING_DIR,
+          `Tmux: ${this.tmuxSession.sessionName}`
+        );
 
         store.saveMessage({
           session_id: tmuxSessionId,

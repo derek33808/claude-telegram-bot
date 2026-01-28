@@ -236,6 +236,24 @@ if (ALLOWED_USERS.length === 0) {
   process.exit(1);
 }
 
+// ============== Auto Lifecycle Configuration ==============
+
+export const BOT_AUTO_LIFECYCLE =
+  (process.env.BOT_AUTO_LIFECYCLE || "false").toLowerCase() === "true";
+
+export const BOT_IDLE_TIMEOUT = parseInt(
+  process.env.BOT_IDLE_TIMEOUT || "1800000",
+  10
+);
+
+export const BOT_IDLE_CHECK_INTERVAL = parseInt(
+  process.env.BOT_IDLE_CHECK_INTERVAL || "300000",
+  10
+);
+
+export const BOT_PID_FILE =
+  process.env.BOT_PID_FILE || "/tmp/claude-telegram-bot.pid";
+
 // ============== Tmux Bridge Configuration ==============
 
 // Re-export tmux config for convenience

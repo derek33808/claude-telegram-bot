@@ -83,10 +83,7 @@ export class TmuxBridge {
       "history-limit", String(this.config.historyLimit),
     ]);
 
-    // Wait for Claude to initialize
-    await Bun.sleep(2000);
-
-    // Create session object
+    // Create session object first (needed for capturePane)
     this.currentSession = {
       sessionName: name,
       windowId: "0",
@@ -101,6 +98,23 @@ export class TmuxBridge {
 
     // Save session metadata
     this.saveSessionMetadata();
+
+    // Wait for Claude CLI to fully initialize (detect ❯ prompt)
+    const maxWait = 30000; // 30 seconds max
+    const startWait = Date.now();
+    let ready = false;
+    while (Date.now() - startWait < maxWait) {
+      await Bun.sleep(1000);
+      const pane = await this.capturePane();
+      // Claude CLI shows ❯ prompt when ready for input
+      if (pane.includes("❯")) {
+        ready = true;
+        break;
+      }
+    }
+    if (!ready) {
+      console.warn(`Claude CLI may not be fully initialized after ${maxWait}ms`);
+    }
 
     console.log(`Created tmux session: ${name}`);
     return this.currentSession;
@@ -151,12 +165,14 @@ export class TmuxBridge {
         const [sessionName, windowId, paneId, path] = line.split(":");
         if (!sessionName) continue;
 
-        // Check if this is a Claude-related session
+        // Show all tmux sessions (not just Claude-prefixed ones)
+        // This allows taking over any session where Claude might be running
+        // Sessions with "claude" in name are marked as Claude-created
         const isClaudeSession =
           sessionName.startsWith(this.config.sessionPrefix) ||
-          sessionName.includes("claude");
+          sessionName.toLowerCase().includes("claude");
 
-        if (!isClaudeSession) continue;
+        // No longer skip non-Claude sessions - show all for takeover
 
         // Get saved metadata or create default
         const saved = savedMetadata[sessionName];
@@ -244,10 +260,6 @@ export class TmuxBridge {
     }
 
     try {
-      // Get baseline output length before sending
-      const baselineOutput = await this.capturePane();
-      const baselineLength = baselineOutput.length;
-
       // Send the message
       await this.sendKeys(message);
       await this.sendKeys("Enter");
@@ -260,9 +272,9 @@ export class TmuxBridge {
       await Bun.sleep(500);
 
       // Create parser and poll for response
-      // Pass baseline length so parser knows where to start looking for new content
+      // Pass the sent message so we can locate the response after it
       const parser = new TerminalOutputParser();
-      return await this.pollForResponse(parser, statusCallback, baselineLength);
+      return await this.pollForResponse(parser, statusCallback, message);
     } finally {
       // Always release lock
       this.releaseLock(this.currentSession.sessionName);
@@ -381,6 +393,50 @@ export class TmuxBridge {
   /**
    * Capture tmux pane content.
    */
+  /**
+   * Capture pane content for any session by name (for summaries).
+   */
+  async capturePaneByName(sessionName: string, lines: number = 30): Promise<string> {
+    try {
+      return await this.executeTmux([
+        "capture-pane", "-t", `${sessionName}:0.0`, "-p", "-S", `-${lines}`,
+      ]);
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * Get a short summary of recent activity in a tmux session.
+   */
+  async getSessionSummary(sessionName: string): Promise<string> {
+    const raw = await this.capturePaneByName(sessionName, 50);
+    if (!raw) return "（无法读取）";
+
+    // Find last user input (❯) and response (⏺)
+    const lines = raw.split("\n");
+    let lastInput = "";
+    let lastResponse = "";
+
+    for (const line of lines) {
+      if (line.match(/^❯\s+.+/)) {
+        lastInput = line.replace(/^❯\s+/, "").trim();
+      }
+      if (line.match(/^⏺\s+(.+)/)) {
+        lastResponse = line.replace(/^⏺\s+/, "").trim();
+      }
+    }
+
+    if (lastInput) {
+      const inputPreview = lastInput.length > 20 ? lastInput.slice(0, 17) + "..." : lastInput;
+      const responsePreview = lastResponse
+        ? (lastResponse.length > 25 ? lastResponse.slice(0, 22) + "..." : lastResponse)
+        : "...";
+      return `💬 ${inputPreview} → ${responsePreview}`;
+    }
+    return "（空会话）";
+  }
+
   private async capturePane(historyLines?: number): Promise<string> {
     if (!this.currentSession) return "";
 
@@ -407,7 +463,7 @@ export class TmuxBridge {
   private async pollForResponse(
     parser: TerminalOutputParser,
     statusCallback: StatusCallback,
-    _baselineLength?: number
+    sentMessage?: string
   ): Promise<string> {
     const startTime = Date.now();
     let lastOutput = "";
@@ -435,27 +491,33 @@ export class TmuxBridge {
         if (paneContent !== lastOutput) {
           lastOutput = paneContent;
 
+          // Extract content AFTER the sent message to only look at the response
+          let newContent = paneContent;
+          if (sentMessage) {
+            const msgIndex = paneContent.lastIndexOf(sentMessage);
+            if (msgIndex >= 0) {
+              newContent = paneContent.slice(msgIndex + sentMessage.length);
+            }
+          }
+
           // Check for processing indicator (Claude started working)
-          if (!sawProcessing && paneContent.includes("✽")) {
+          if (!sawProcessing && newContent.includes("✽")) {
             sawProcessing = true;
             console.log("Claude is processing...");
             await statusCallback("thinking", "Processing...");
           }
 
           // Check for response indicator (Claude responding)
-          // This may appear before or without the processing indicator for fast responses
-          if (!sawResponse && paneContent.includes("⏺")) {
+          if (!sawResponse && newContent.includes("⏺")) {
             sawResponse = true;
             console.log("Claude is responding...");
-            // IMPORTANT: Reset parser when we see response to ensure we capture it
-            // The response might already be in content that was "processed" before
             parser.reset();
           }
 
           // Only start parsing after we've seen either processing or response
           if (sawProcessing || sawResponse) {
-            // Feed to parser
-            const blocks = parser.feed(paneContent);
+            // Feed only content after the user message to parser
+            const blocks = parser.feed(newContent);
 
             // Emit callbacks for each block
             for (const block of blocks) {

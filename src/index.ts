@@ -6,8 +6,9 @@
 
 import { Bot } from "grammy";
 import { run, sequentialize } from "@grammyjs/runner";
-import { TELEGRAM_TOKEN, WORKING_DIR, ALLOWED_USERS, RESTART_FILE } from "./config";
+import { TELEGRAM_TOKEN, WORKING_DIR, ALLOWED_USERS, RESTART_FILE, BOT_AUTO_LIFECYCLE } from "./config";
 import { unlinkSync, readFileSync, existsSync } from "fs";
+import { LifecycleManager } from "./lifecycle";
 import {
   handleStart,
   handleHelp,
@@ -50,6 +51,16 @@ bot.use(
     return ctx.chat?.id.toString();
   })
 );
+
+// ============== Lifecycle Manager ==============
+
+const lifecycle = new LifecycleManager();
+
+// Reset idle timer on any Telegram activity
+bot.use((ctx, next) => {
+  lifecycle.resetIdleTimer();
+  return next();
+});
 
 // ============== Command Handlers ==============
 
@@ -124,7 +135,20 @@ if (existsSync(RESTART_FILE)) {
 }
 
 // Start with concurrent runner (commands work immediately)
-const runner = run(bot);
+// Configure retry to handle network errors (ECONNRESET, etc.)
+const runner = run(bot, {
+  runner: {
+    maxRetryTime: Infinity,
+    retryInterval: "exponential",
+    silent: false,
+    fetch: {
+      timeout: 15, // Shorter long-polling timeout to reduce ECONNRESET
+    },
+  },
+});
+
+// Initialize lifecycle manager (writes PID file, starts idle checks if enabled)
+lifecycle.start(runner, bot);
 
 // Graceful shutdown
 const stopRunner = () => {
@@ -132,6 +156,7 @@ const stopRunner = () => {
     console.log("Stopping bot...");
     runner.stop();
   }
+  lifecycle.removePidFile();
 };
 
 process.on("SIGINT", () => {

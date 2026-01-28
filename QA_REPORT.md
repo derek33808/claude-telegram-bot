@@ -4,8 +4,8 @@
 - **Project Name**: claude-telegram-bot
 - **QA Responsible**: qa-guardian
 - **Report Creation Date**: 2026-01-25
-- **Last Update Date**: 2026-01-26 (Tmux Bridge Review)
-- **Current Status**: Tmux Bridge Feature Review Complete
+- **Last Update Date**: 2026-01-28 (Sessions Summary + Auto Lifecycle Review)
+- **Current Status**: Sessions Summary Feature Reviewed, Auto Lifecycle Design Reviewed
 
 ---
 
@@ -26,6 +26,119 @@
 ---
 
 ## Code Review Record
+
+### Review #5 - 2026-01-28 (Auto Lifecycle Design Review)
+
+#### Review Scope
+- `DESIGN-auto-lifecycle.md` - Auto start/exit lifecycle management design
+
+#### Design Quality Score: 4/5
+
+**Completeness Assessment**:
+
+| Criterion | Status | Notes |
+|-----------|--------|-------|
+| Goals clear | PASS | Auto-start via tmux hook + auto-exit via idle detection |
+| Requirements verifiable | PASS | Clear start/exit triggers defined |
+| Tech approach justified | PASS | Alternatives table with rationale |
+| Architecture documented | PASS | Module structure, data flow, integration points |
+| Implementation plan | PASS | File change list, 8-step test plan |
+| Acceptance criteria | PARTIAL | Test plan exists but no measurable pass/fail thresholds |
+
+**Strengths**:
+1. Thorough alternatives analysis for auto-start (4 options compared)
+2. Clear exit conditions (all 3 must be met: Telegram idle + no active sessions + no running requests)
+3. Edge cases well-documented (PID residual, tmux unavailable, multiple sessions, manual start, network disconnect)
+4. Integration points clearly identified with code examples
+5. Middleware approach for idle timer reset is clean and non-intrusive
+
+**Issues Found**:
+
+| Severity | Section | Issue | Recommendation |
+|----------|---------|-------|----------------|
+| MEDIUM | Section 2.2 | Exit condition "no active Claude tmux session" could conflict with CLI sessions user wants to keep alive | Clarify: does "active" mean bot-created only or all sessions? |
+| LOW | Section 1 | `auto-start.sh` uses `grep -qi "claude"` which may false-positive on session names containing "claude" that aren't Claude CLI | Use more specific detection (e.g., check `pane_current_command` for exact match) |
+| LOW | Section 4 | PID file in `/tmp` may be cleared on OS reboot, but PID file absence already handled gracefully | No action needed |
+| LOW | Section 7.4 | "手动 bun run start 不写 PID 文件（或通过环境变量区分）" is ambiguous | Decide on one approach and document it |
+| INFO | Section 3 | `BOT_IDLE_TIMEOUT` default 30min (1800000ms) is reasonable but may be too short for users who leave and come back | Consider making prominently configurable |
+
+**Missing Elements**:
+1. No rollback strategy if auto-start script fails
+2. No monitoring/alerting for repeated start/stop cycles (possible crash loop)
+3. No logging strategy for lifecycle events beyond console.log
+
+---
+
+### Review #4 - 2026-01-28 (Sessions Summary Feature Code Review)
+
+#### Review Scope
+- `src/tmux/bridge.ts` - `getSessionSummary()`, `capturePaneByName()`
+- `src/session.ts` - `getTmuxSessionSummary()`
+- `src/handlers/commands.ts` - `handleSessions` (tmux mode path)
+
+#### Code Quality Score: 4/5
+
+**New Functions Analyzed**:
+
+**1. `capturePaneByName()` (bridge.ts:399-407)**
+
+Good:
+- Simple, focused function
+- Hardcodes `:0.0` target (first window, first pane) which is correct for Claude sessions
+- Returns empty string on failure (graceful degradation)
+- Configurable line count parameter with sensible default (30)
+
+Concern:
+- Assumes single-window, single-pane sessions. If a user creates multiple panes, this will only capture the first.
+
+**2. `getSessionSummary()` (bridge.ts:412-438)**
+
+Good:
+- Captures 50 lines (more than capturePaneByName default) for broader context
+- Uses regex to detect Claude CLI markers (prompt character and response character)
+- Truncates output to reasonable preview lengths (20 chars input, 25 chars response)
+- Fallback values for empty sessions and unreadable sessions
+
+Issues:
+
+| Severity | Line | Issue |
+|----------|------|-------|
+| LOW | 422-428 | Regex `^[prompt]\s+.+` and `^[circle]\s+(.+)` require markers at line start. If terminal wrapping or ANSI codes shift content, these may not match. |
+| LOW | 431-436 | Only shows the LAST input/response pair. If the user sent multiple messages, earlier context is lost from the summary. |
+| INFO | 435 | Return format uses emoji which renders well in Telegram but would need adjustment for other output targets. |
+
+**3. `getTmuxSessionSummary()` (session.ts:171-175)**
+
+Clean pass-through function. No issues.
+
+**4. `handleSessions` tmux path (commands.ts:384-436)**
+
+Good:
+- Awaits summary for each session (sequential, prevents tmux command overlap)
+- Clean HTML formatting with creator/ownership indicators
+- Inline keyboard buttons for session selection
+
+Issues:
+
+| Severity | Line | Issue |
+|----------|------|-------|
+| MEDIUM | 399-410 | Sequential `await` for each session summary. If there are many tmux sessions, this could cause noticeable delay. Consider `Promise.all()` for parallel capture. |
+| LOW | 419 | Button callback_data `tmux:${s.sessionName}` - if session name exceeds Telegram's 64-byte callback_data limit, the button will fail silently. |
+| INFO | 412 | Summary text is included in the message body (good UX - user sees context before choosing). |
+
+#### E2E Test Verification
+
+**Reported**: /sessions command displays summaries and selection buttons correctly in Telegram Web.
+
+**QA Assessment**: ACCEPTED - The reported E2E test confirms the core user-facing functionality works. The feature provides useful session context that helps users select the correct session to take over.
+
+**Remaining Test Gaps**:
+1. Session with no Claude activity (empty pane)
+2. Session with very long output (buffer overflow in summary)
+3. Session name exceeding Telegram callback_data limit
+4. Multiple concurrent summary captures
+
+---
 
 ### Review #3 - 2026-01-26 (Tmux Bridge Feature Review)
 
@@ -391,6 +504,10 @@ This is a TypeScript error that would cause compilation issues. The second defin
 | I001 | Issue | Duplicate handleHealth function | HIGH | Resolved | Fixed - only one definition exists |
 | I006 | Issue | Unused `_baselineLength` parameter in bridge.ts | LOW | Open | Remove or implement |
 | I007 | Issue | Unused `lastPromptCheck` field in parser.ts | LOW | Open | Remove unused field |
+| R007 | Risk | Sequential summary fetching in handleSessions may be slow with many sessions | MEDIUM | Open | Consider Promise.all() for parallel capture |
+| R008 | Risk | Session name could exceed Telegram 64-byte callback_data limit | LOW | Open | Add length validation or truncation |
+| R009 | Risk | Auto-lifecycle exit condition ambiguity for CLI sessions | MEDIUM | Open | Clarify "active session" definition in design |
+| I008 | Issue | getSessionSummary regex may miss markers with ANSI codes | LOW | Open | Consider stripping ANSI before matching |
 | I004 | Issue | SQLite undefined/null handling | MEDIUM | ✅ Resolved | All conversions verified correct |
 | I005 | Issue | Foreign key constraint in updateState | MEDIUM | ✅ Resolved | upsertUser() called first |
 | I002 | Issue | No automated test suite | MEDIUM | Open | Add unit tests for security module |
@@ -407,6 +524,7 @@ This is a TypeScript error that would cause compilation issues. The second defin
 | Unit Tests | Not Started | - | - | Project Agent |
 | E2E Local | PASS | 2026-01-25 16:30 | 2026-01-25 16:30 | Project Agent |
 | Tmux E2E | PASS | 2026-01-26 | 2026-01-26 | Project Agent |
+| Sessions Summary E2E | PASS | 2026-01-28 | 2026-01-28 | Project Agent |
 | Public Deployment | Not Required | - | - | - |
 | E2E Public | Not Required | - | - | - |
 | QA Acceptance | COMPLETE | 2026-01-25 | 2026-01-26 | qa-guardian |
@@ -478,7 +596,7 @@ This is a TypeScript error that would cause compilation issues. The second defin
 
 ## Final Quality Assessment
 
-### Overall Score: 4/5 (Updated 2026-01-26)
+### Overall Score: 4/5 (Updated 2026-01-28)
 
 **Quality Dimension Assessment**:
 - Functionality: 4.5/5 - Core features work well, tmux integration well designed

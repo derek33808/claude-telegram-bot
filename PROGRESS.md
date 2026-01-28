@@ -1,11 +1,104 @@
 # 项目进度
 
 ## 当前状态
-- **阶段**: Tmux Bridge 功能开发完成
-- **任务**: 实现 tmux 桥接，让 Telegram Bot 与 Claude CLI 共享终端
-- **状态**: ✅ 代码完成，E2E 测试通过
+- **阶段**: 自动生命周期功能开发完成
+- **任务**: /sessions 摘要优化 + 自动启动/退出功能
+- **状态**: ✅ 开发完成，typecheck 通过
 
 ## 执行日志（按时间倒序）
+
+### 2026-01-28 11:35 - 自动生命周期管理功能
+**任务**: 设计并开发 bot 自动启动/退出功能
+**状态**: ✅ 完成
+
+**多 Agent 协作流程**:
+| Agent | 任务 | 结果 |
+|-------|------|------|
+| Test | /sessions 摘要 E2E 测试 | ✅ 6/6 通过 |
+| PM | 自动启动/退出设计 | ✅ DESIGN-auto-lifecycle.md |
+| QA | 设计+代码审查 | ✅ 评分 4/5 |
+| Dev | 自动生命周期开发 | ✅ Typecheck 通过 |
+
+**新建文件**:
+- `src/lifecycle.ts` - LifecycleManager（空闲检测、优雅退出、PID 管理）
+- `scripts/auto-start.sh` - tmux hook 自动启动脚本
+- `scripts/install-hooks.sh` - 一键安装 tmux hook
+- `DESIGN-auto-lifecycle.md` - 设计文档
+
+**修改文件**:
+- `src/config.ts` - 添加 BOT_AUTO_LIFECYCLE 等 4 个配置项
+- `src/index.ts` - 集成 LifecycleManager + middleware
+- `src/handlers/commands.ts` - Promise.all() 并行获取摘要
+
+**QA 反馈已处理**:
+- 活跃 session 只检查 `claude-tg-` 前缀
+- handleSessions 改为 Promise.all() 并行
+- gracefulShutdown 发送 Telegram 通知
+
+---
+
+### 2026-01-28 11:25 - /sessions 摘要功能
+**任务**: /sessions 命令显示每个会话的内容摘要
+**状态**: ✅ 完成
+
+**新增功能**:
+- `capturePaneByName()` - 按 session 名称捕获 tmux pane 内容
+- `getSessionSummary()` - 提取最后一条输入→响应摘要
+- `handleSessions` 更新 - 每个会话显示 💬 input → response
+
+**E2E 测试结果**: 6/6 全部通过
+
+---
+
+### 2026-01-28 11:10 - Tmux Bridge E2E 集成测试 + Bug 修复
+**任务**: 通过 Telegram Web 进行完整 E2E 测试，修复发现的 bug
+**状态**: ✅ 完成
+
+**修复的 Bug (4个)**:
+| Bug | 原因 | 修复 |
+|-----|------|------|
+| Bot 网络错误崩溃 (ECONNRESET) | grammY runner 未配置重试 | 添加 `maxRetryTime: Infinity, retryInterval: "exponential"` |
+| Claude CLI 初始化超时 | `createSession` 只等 2s，CLI 未就绪就发消息 | 改为轮询检测 `❯` prompt，最多等 30s |
+| 多消息返回旧响应 | `pollForResponse` 用字符长度 baseline 切片，无法正确定位新内容 | 改用 `sentMessage` 文本定位，`lastIndexOf` 找到消息位置后取后续内容 |
+| Prompt placeholder 导致完成检测失败 | Claude Code v2.1+ prompt 行含建议文字 `❯ help me...`，不匹配 `^❯\s*$` | 添加 relaxed prompt pattern，结合 separator 行检测完成 |
+
+**修改文件**:
+- `src/index.ts` - runner 添加 retry 配置和 shorter fetch timeout
+- `src/tmux/bridge.ts` - 修复 createSession 初始化等待、pollForResponse 内容定位
+- `src/tmux/parser.ts` - 添加 PROMPT_RELAXED pattern、改进 checkCompletion
+
+**E2E 测试结果** (Telegram Web):
+- ✅ 文字消息响应（"5+5?" → "10"）
+- ✅ 多消息连续响应（"capital of Japan?" → "Tokyo"）
+- ✅ /status 显示 tmux 状态信息
+- ✅ /help 显示中文帮助
+- ✅ /new 清除会话
+- ✅ Bot 网络错误后自动重连（不崩溃）
+
+---
+
+### 2026-01-26 12:00 - Tmux Bridge SQLite Bug 修复
+**任务**: 修复 tmux 模式下的 SQLite 外键约束错误
+**状态**: ✅ 完成
+
+**修复的 Bug**:
+| Bug | 原因 | 修复 |
+|-----|------|------|
+| `FOREIGN KEY constraint failed` | tmux 模式保存消息前未创建 session 记录 | 在 `_sendMessageViaTmux` 中添加 `store.createSession()` 调用 |
+| `NOT NULL constraint failed: sessions.working_dir` | 使用不存在的 `this.workingDir` 属性 | 改用导入的 `WORKING_DIR` 常量 |
+
+**修改文件**:
+- `src/session.ts:353-359` - 添加 createSession 调用，修复 workingDir 引用
+
+**E2E 测试结果** (Telegram Web):
+- ✅ 文字消息响应正常
+- ✅ /status 命令显示 tmux 状态
+- ✅ /help 命令显示中文帮助
+- ✅ /new 命令清除会话
+- ✅ 新会话消息正常响应
+- ✅ 无 SQLite 错误
+
+---
 
 ### 2026-01-26 - Tmux Bridge 功能开发完成
 **任务**: 实现 tmux 桥接功能

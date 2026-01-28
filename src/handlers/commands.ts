@@ -393,8 +393,15 @@ export async function handleSessions(ctx: Context): Promise<void> {
       return;
     }
 
-    // Build inline keyboard with tmux session list
-    const buttons = tmuxSessions.map((s) => {
+    // Build session list with summaries (fetch all summaries in parallel)
+    const summaries = await Promise.all(
+      tmuxSessions.map((s) => session.getTmuxSessionSummary(s.sessionName))
+    );
+
+    const sessionInfos: string[] = [];
+    const buttons = [];
+    for (let i = 0; i < tmuxSessions.length; i++) {
+      const s = tmuxSessions[i]!;
       const lastActive = s.lastActivity
         ? new Date(s.lastActivity).toLocaleTimeString("zh-CN", {
             hour: "2-digit",
@@ -404,18 +411,23 @@ export async function handleSessions(ctx: Context): Promise<void> {
       const creator = s.createdBy === "telegram" ? "🤖" : "💻";
       const owned = s.isOwned ? "🔒" : "";
 
-      return [
+      sessionInfos.push(
+        `${creator} <b>${s.sessionName}</b> ${owned} (${lastActive})\n   ${summaries[i]}`
+      );
+
+      // Button text: short name + time
+      buttons.push([
         {
           text: `${creator} ${s.sessionName} ${owned} (${lastActive})`,
           callback_data: `tmux:${s.sessionName}`,
         },
-      ];
-    });
+      ]);
+    }
 
     await ctx.reply(
       "🖥️ <b>Tmux 会话列表</b>\n\n" +
-        "💻 = CLI 创建  🤖 = Telegram 创建  🔒 = 已被接管\n\n" +
-        "选择一个会话来接管：",
+        sessionInfos.join("\n\n") +
+        "\n\n选择一个会话来接管：",
       {
         parse_mode: "HTML",
         reply_markup: {
