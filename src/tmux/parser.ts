@@ -424,6 +424,22 @@ export class TerminalOutputParser {
 
     // First try strict prompt (empty ❯)
     if (PATTERNS.PROMPT.test(lastLines)) {
+      // During TOOL_USE, a ❯ prompt may appear temporarily (e.g., tool confirmation).
+      // Only mark complete if NOT in tool_use state, or if there's also a ⏺ response before the prompt.
+      if (this.state === ParseState.TOOL_USE) {
+        // Check if there's a response (⏺) between the tool and this prompt
+        const lastResponseIdx = buffer.lastIndexOf("⏺");
+        const lastToolIdx = Math.max(
+          buffer.lastIndexOf("● "),
+          buffer.lastIndexOf("○ "),
+          buffer.lastIndexOf("◉ "),
+          buffer.lastIndexOf("◐ ")
+        );
+        // If the last tool marker is after the last response, we're still mid-tool
+        if (lastToolIdx > lastResponseIdx) {
+          return; // Don't mark complete during tool execution
+        }
+      }
       if (this.state !== ParseState.COMPLETE) {
         this.state = ParseState.COMPLETE;
         this.promptDetectedAt = Date.now();
@@ -434,7 +450,9 @@ export class TerminalOutputParser {
     // Relaxed check: after we've seen a response (⏺), any ❯ at the end
     // indicates completion. Claude Code v2.1+ shows placeholder suggestions
     // like "❯ help me start a new project" which won't match the strict pattern.
-    if (this.state === ParseState.TEXT_OUTPUT || this.state === ParseState.TOOL_USE) {
+    // IMPORTANT: Only use relaxed check in TEXT_OUTPUT state, NOT TOOL_USE.
+    // During tool execution, separators and prompts appear temporarily.
+    if (this.state === ParseState.TEXT_OUTPUT) {
       // Check if the last non-empty lines contain a separator (─) followed by ❯
       // This is the Claude Code TUI pattern: response → separator → prompt
       const lastFew = lines.slice(-4);
@@ -456,10 +474,11 @@ export class TerminalOutputParser {
       return false;
     }
 
-    // Add a small delay to ensure all output has been captured
-    // (tmux output can be slightly delayed)
+    // Stability delay: wait to ensure all output has been captured.
+    // Claude CLI may show a prompt briefly during tool execution before
+    // continuing with more output. A longer delay reduces false positives.
     const timeSincePrompt = Date.now() - this.promptDetectedAt;
-    return timeSincePrompt >= 500; // 500ms stability delay
+    return timeSincePrompt >= 2000; // 2s stability delay
   }
 
   /**
@@ -485,6 +504,17 @@ export class TerminalOutputParser {
    */
   getState(): ParseState {
     return this.state;
+  }
+
+  /**
+   * Revoke a premature COMPLETE state (content changed after prompt detected).
+   * Returns to TEXT_OUTPUT state so parsing continues.
+   */
+  revokeCompletion(): void {
+    if (this.state === ParseState.COMPLETE) {
+      this.state = ParseState.TEXT_OUTPUT;
+      this.promptDetectedAt = 0;
+    }
   }
 
   /**

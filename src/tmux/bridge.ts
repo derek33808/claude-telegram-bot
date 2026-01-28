@@ -23,6 +23,7 @@ import {
   TMUX_CLI_WATCH,
 } from "./config";
 import { TerminalOutputParser } from "./parser";
+import { ParseState } from "./types";
 
 /**
  * TmuxBridge manages Claude Code sessions via tmux.
@@ -543,6 +544,14 @@ export class TmuxBridge {
                 lastSlicedContent = newContent;
               }
             }
+          }
+
+          // If parser was in COMPLETE state but content changed, revoke completion
+          // This handles the case where Claude shows a prompt briefly during tool
+          // execution but then continues with more output
+          if (parser.getState() === ParseState.COMPLETE) {
+            parser.revokeCompletion();
+            console.log("Content changed after completion detected - revoking completion");
           }
 
           // Check for processing indicator (Claude started working)
