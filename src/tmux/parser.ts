@@ -154,34 +154,27 @@ export class TerminalOutputParser {
     // Clean the output
     const cleaned = cleanOutput(rawOutput);
 
-    // Detect content displacement (content shifted rather than grew)
-    // This happens when the tmux scrollback anchor scrolls out
-    if (cleaned.length <= this.processedLength && this.buffer) {
-      // Check if the content actually changed (displacement) vs just no new content
-      const bufferTail = this.buffer.slice(-200);
-      const cleanedTail = cleaned.slice(-200);
-      if (bufferTail !== cleanedTail && cleaned.length > 0) {
-        // Content displaced - find overlap and adjust processedLength
-        const overlapLen = Math.min(this.buffer.length, cleaned.length, 500);
-        const oldTail = this.buffer.slice(-overlapLen);
-        const idx = cleaned.lastIndexOf(oldTail);
-        if (idx >= 0) {
-          // Found overlap - only process content after the overlap
-          this.processedLength = idx + overlapLen;
-        } else {
-          // No overlap found - reset and reprocess
-          console.warn("Parser: content displacement with no overlap, resetting processedLength");
-          this.processedLength = 0;
-        }
+    // Handle content shrinkage (sentMessage scrolled out, so the sliced
+    // content fed to us got shorter). In this case, find what's still common
+    // and only process genuinely new content.
+    if (cleaned.length < this.processedLength && this.buffer) {
+      // Find how much of the old buffer tail is present in the new content
+      const checkLen = Math.min(this.buffer.length, cleaned.length, 300);
+      const oldTail = this.buffer.slice(-checkLen);
+      const tailIdx = cleaned.lastIndexOf(oldTail);
+      if (tailIdx >= 0) {
+        // Old content is still there — adjust processedLength to its end
+        this.processedLength = tailIdx + checkLen;
       } else {
-        // No change - just check completion
-        this.checkCompletion(cleaned);
-        return [];
+        // Content completely changed — reset but keep accumulated text
+        // (to avoid losing already-parsed response text)
+        this.processedLength = 0;
       }
     }
 
-    // Only process new content
+    // Only process new content (beyond what we've already seen)
     if (cleaned.length <= this.processedLength) {
+      // No new content, but always re-check completion on latest buffer
       this.checkCompletion(cleaned);
       return [];
     }
@@ -478,7 +471,7 @@ export class TerminalOutputParser {
     // Claude CLI may show a prompt briefly during tool execution before
     // continuing with more output. A longer delay reduces false positives.
     const timeSincePrompt = Date.now() - this.promptDetectedAt;
-    return timeSincePrompt >= 2000; // 2s stability delay
+    return timeSincePrompt >= 1500; // 1.5s stability delay
   }
 
   /**

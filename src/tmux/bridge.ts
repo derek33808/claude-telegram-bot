@@ -488,9 +488,10 @@ export class TmuxBridge {
     let sawProcessing = false;
     let sawResponse = false;
 
-    // Stable content tracking: remember the last successful slice anchor
-    let lastSliceAnchor: string | null = sentMessage || null;
-    let lastSlicedContent: string = "";
+    // Simple approach: always feed the FULL content after sentMessage to the parser.
+    // The parser handles dedup via processedLength internally.
+    // When sentMessage scrolls out, we feed the full pane — parser still works
+    // because it only processes content beyond its processedLength.
 
     this.pollAbortController = new AbortController();
 
@@ -502,7 +503,7 @@ export class TmuxBridge {
         }
 
         // Check abort
-        if (this.pollAbortController.signal.aborted) {
+        if (this.pollAbortController?.signal.aborted) {
           throw new Error("Response cancelled");
         }
 
@@ -513,45 +514,14 @@ export class TmuxBridge {
         if (paneContent !== lastOutput) {
           lastOutput = paneContent;
 
-          // Extract content AFTER the sent message to only look at the response
+          // Extract content after the sent message
           let newContent = paneContent;
-          if (lastSliceAnchor) {
-            const msgIndex = paneContent.lastIndexOf(lastSliceAnchor);
+          if (sentMessage) {
+            const msgIndex = paneContent.lastIndexOf(sentMessage);
             if (msgIndex >= 0) {
-              newContent = paneContent.slice(msgIndex + lastSliceAnchor.length);
-              lastSlicedContent = newContent;
-            } else {
-              // Anchor scrolled out of scrollback - use diff-based fallback
-              // Find how much of the previous sliced content is still at the end of pane
-              if (lastSlicedContent) {
-                // Look for overlap: find the tail of lastSlicedContent in new paneContent
-                const tailLen = Math.min(lastSlicedContent.length, 500);
-                const tail = lastSlicedContent.slice(-tailLen);
-                const tailIdx = paneContent.lastIndexOf(tail);
-                if (tailIdx >= 0) {
-                  // Content after the known tail is the truly new content
-                  newContent = paneContent.slice(tailIdx);
-                  lastSlicedContent = newContent;
-                } else {
-                  // Complete discontinuity - reset parser and use full pane
-                  console.warn("Content anchor lost and no overlap found, resetting parser");
-                  parser.resetProcessedLength();
-                  newContent = paneContent;
-                  lastSlicedContent = newContent;
-                }
-              } else {
-                newContent = paneContent;
-                lastSlicedContent = newContent;
-              }
+              newContent = paneContent.slice(msgIndex + sentMessage.length);
             }
-          }
-
-          // If parser was in COMPLETE state but content changed, revoke completion
-          // This handles the case where Claude shows a prompt briefly during tool
-          // execution but then continues with more output
-          if (parser.getState() === ParseState.COMPLETE) {
-            parser.revokeCompletion();
-            console.log("Content changed after completion detected - revoking completion");
+            // If sentMessage scrolled out, just use full pane — parser handles dedup
           }
 
           // Check for processing indicator (Claude started working)
@@ -570,7 +540,7 @@ export class TmuxBridge {
 
           // Only start parsing after we've seen either processing or response
           if (sawProcessing || sawResponse) {
-            // Feed only content after the user message to parser
+            // Feed content to parser (it handles incremental processing)
             const blocks = parser.feed(newContent);
 
             // Emit callbacks for each block
@@ -581,7 +551,7 @@ export class TmuxBridge {
             // Check completion only after we've seen the response
             if (sawResponse && parser.isComplete()) {
               const response = parser.getTextResponse();
-              console.log(`Response complete. Text: "${response.slice(0, 100)}"`);
+              console.log(`Response complete. Text length: ${response.length}, first 100: "${response.slice(0, 100)}"`);
               // Update watcher baseline
               this.lastKnownPaneContent = paneContent;
               await statusCallback("done", "");
