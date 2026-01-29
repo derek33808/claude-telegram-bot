@@ -41,11 +41,12 @@ export const PATTERNS = {
   /** Tool use start - common tool emojis and names */
   TOOL_START: /^[🔧📁📝💻🔍🌐⚡]\s*\w+/m,
 
-  /** Claude Code tool patterns - ● Read, ● Write, ● Bash, etc. */
-  CLAUDE_TOOL: /^[●○◉◐]\s*(Read|Write|Edit|Bash|Glob|Grep|WebFetch|WebSearch|Task|TodoWrite|NotebookEdit|AskUserQuestion)/m,
+  /** Claude Code tool patterns - ⏺ ToolName(...), ● ToolName, etc.
+   * Matches any PascalCase tool name followed by ( */
+  CLAUDE_TOOL: /^[●○◉◐⏺]\s*[A-Z][a-zA-Z]*\s*\(/m,
 
-  /** Tool output lines (indented with └ or │ or spaces) */
-  TOOL_OUTPUT: /^[\s│└├─┬┴┼]+/,
+  /** Tool output lines (indented with └ ⎿ │ or spaces) */
+  TOOL_OUTPUT: /^[\s│└├─┬┴┼⎿]+/,
 
   /** Collapsed content indicator */
   COLLAPSED: /^…\s*\+?\d+\s*lines?/,
@@ -315,10 +316,22 @@ export class TerminalOutputParser {
       if (responseMatch) {
         const responseText = responseMatch[1] || "";
         if (responseText) {
-          this.textAccumulator += (this.textAccumulator ? "\n" : "") + responseText;
-          this.currentBlockContent = responseText;
-          this.state = ParseState.TEXT_OUTPUT;
-          blocks.push({ type: "text", content: responseText });
+          // Check if this is actually a tool call (e.g., "⏺ Read(...)")
+          if (PATTERNS.CLAUDE_TOOL.test(line)) {
+            // Emit any accumulated text content first
+            if (this.currentBlockContent && this.state === ParseState.TEXT_OUTPUT) {
+              blocks.push({ type: "text", content: this.currentBlockContent.trim() });
+            }
+            this.currentBlockContent = "";
+            this.state = ParseState.TOOL_USE;
+            blocks.push({ type: "tool", content: responseText });
+          } else {
+            // Regular text response
+            this.textAccumulator += (this.textAccumulator ? "\n" : "") + responseText;
+            this.currentBlockContent = responseText;
+            this.state = ParseState.TEXT_OUTPUT;
+            blocks.push({ type: "text", content: responseText });
+          }
         }
         continue;
       }
@@ -345,8 +358,8 @@ export class TerminalOutputParser {
         continue;
       }
 
-      // Check for tool start (emoji-based)
-      if (PATTERNS.TOOL_START.test(line) || PATTERNS.TOOL_RUNNING.test(line)) {
+      // Check for tool start (emoji-based or Claude Code format like "⏺ Read(...)")
+      if (PATTERNS.TOOL_START.test(line) || PATTERNS.TOOL_RUNNING.test(line) || PATTERNS.CLAUDE_TOOL.test(line)) {
         // Emit any accumulated content
         if (this.currentBlockContent && this.state === ParseState.THINKING) {
           blocks.push({ type: "thinking", content: this.currentBlockContent.trim() });

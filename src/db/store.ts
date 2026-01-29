@@ -50,7 +50,7 @@ export interface SessionState {
  */
 export class SessionStore {
   private db: Database;
-  private readonly LOCK_TIMEOUT_MS = 30000; // 30 seconds
+  private readonly LOCK_TIMEOUT_MS = 600000; // 10 minutes (matches tmux poll timeout)
 
   constructor(dbPath: string) {
     // Ensure directory exists

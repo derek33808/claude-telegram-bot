@@ -549,6 +549,9 @@ export class TmuxBridge {
             }
 
             // Check completion only after we've seen the response
+            if (sawResponse) {
+              console.log(`[poll] state=${parser.getState()}, isComplete=${parser.isComplete()}, textLen=${parser.getTextResponse().length}`);
+            }
             if (sawResponse && parser.isComplete()) {
               const response = parser.getTextResponse();
               console.log(`Response complete. Text length: ${response.length}, first 100: "${response.slice(0, 100)}"`);
