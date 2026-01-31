@@ -245,10 +245,18 @@ export class SessionStore {
    * Get message history for a session
    */
   getMessages(sessionId: string, limit?: number): MessageData[] {
-    const stmt = this.db.prepare(`
-      SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC ${limit ? `LIMIT ${limit}` : ''}
-    `);
-    return stmt.all(sessionId) as MessageData[];
+    // Use parameterized query to prevent SQL injection
+    if (limit !== undefined) {
+      const stmt = this.db.prepare(`
+        SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ?
+      `);
+      return stmt.all(sessionId, limit) as MessageData[];
+    } else {
+      const stmt = this.db.prepare(`
+        SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC
+      `);
+      return stmt.all(sessionId) as MessageData[];
+    }
   }
 
   /**

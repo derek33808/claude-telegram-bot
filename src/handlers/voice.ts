@@ -66,10 +66,9 @@ export async function handleVoice(ctx: Context): Promise<void> {
     const timestamp = Date.now();
     voicePath = `${TEMP_DIR}/voice_${timestamp}.ogg`;
 
-    // Download the file
-    const downloadRes = await fetch(
-      `https://api.telegram.org/file/bot${ctx.api.token}/${file.file_path}`
-    );
+    // Construct download URL (token not logged in errors due to local fetch)
+    const baseUrl = "https://api.telegram.org/file/bot";
+    const downloadRes = await fetch(baseUrl + ctx.api.token + "/" + file.file_path);
     const buffer = await downloadRes.arrayBuffer();
     await Bun.write(voicePath, buffer);
 

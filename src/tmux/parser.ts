@@ -480,6 +480,12 @@ export class TerminalOutputParser {
       return false;
     }
 
+    // promptDetectedAt must be set (not 0) for valid completion check.
+    // If it's 0, the prompt was never properly detected.
+    if (this.promptDetectedAt === 0) {
+      return false;
+    }
+
     // Stability delay: wait to ensure all output has been captured.
     // Claude CLI may show a prompt briefly during tool execution before
     // continuing with more output. A longer delay reduces false positives.

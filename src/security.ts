@@ -132,22 +132,43 @@ export function checkCommandSafety(
   // Special handling for rm commands - validate paths
   if (lowerCommand.includes("rm ")) {
     try {
-      // Simple parsing: extract arguments after rm
       const rmMatch = command.match(/rm\s+(.+)/i);
       if (rmMatch) {
-        const args = rmMatch[1]!.split(/\s+/);
-        for (const arg of args) {
-          // Skip flags
-          if (arg.startsWith("-") || arg.length <= 1) continue;
+        const argsString = rmMatch[1]!;
 
-          // Check if path is allowed
+        // Reject commands with shell metacharacters that could bypass validation
+        if (/\$\(|`|\$\{|[|;&]|\*\*/.test(argsString)) {
+          return [false, "rm command contains unsafe shell patterns"];
+        }
+
+        // Parse arguments, respecting quotes
+        const args: string[] = [];
+        let current = "";
+        let inQuote: string | null = null;
+        let escaped = false;
+
+        for (const char of argsString) {
+          if (escaped) { current += char; escaped = false; continue; }
+          if (char === "\\") { escaped = true; continue; }
+          if ((char === '"' || char === "'") && !inQuote) { inQuote = char; continue; }
+          if (char === inQuote) { inQuote = null; continue; }
+          if (char === " " && !inQuote) {
+            if (current) { args.push(current); current = ""; }
+            continue;
+          }
+          current += char;
+        }
+        if (current) args.push(current);
+
+        // Validate each path argument
+        for (const arg of args) {
+          if (arg.startsWith("-") || arg.length <= 1) continue;
           if (!isPathAllowed(arg)) {
             return [false, `rm target outside allowed paths: ${arg}`];
           }
         }
       }
     } catch {
-      // If parsing fails, be cautious
       return [false, "Could not parse rm command for safety check"];
     }
   }

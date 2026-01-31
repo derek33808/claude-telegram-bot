@@ -4,8 +4,8 @@
  * Control Claude Code from your phone via Telegram.
  */
 
-// Workaround: Bun TLS verification fails behind some proxies/VPNs
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? "0";
+// TLS verification - enabled by default for security
+// Only disable if explicitly set in environment (e.g., NODE_TLS_REJECT_UNAUTHORIZED=0 for proxies/VPNs)
 
 import { Bot } from "grammy";
 import { run, sequentialize } from "@grammyjs/runner";
